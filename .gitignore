@@ -21,3 +21,6 @@ exports/
 .vscode/
 *.swp
 *.swo
+
+# Debugging and Scratch directory
+debugging/

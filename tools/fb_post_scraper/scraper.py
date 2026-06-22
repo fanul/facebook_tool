@@ -3,6 +3,9 @@ import json
 import csv
 import time
 import re
+import random
+import math
+import sys
 import urllib.parse as urlparse
 from datetime import datetime
 from rich.console import Console
@@ -102,8 +105,156 @@ class FacebookPostScraper(BaseTool):
         engine = ScrapingEngine(config)
         graphql_data = []
 
-        # We'll scroll page_action to trigger GraphQL requests
-        num_scrolls = max(1, min(25, limit // 3))
+        # Define all helper functions for parsing first, so scroll_action and later parsing can use them.
+        def search_for_stories(data):
+            stories = []
+            if isinstance(data, dict):
+                typename = data.get("__typename")
+                if typename in ["Story", "FeedUnit"] or "comet_sections" in data:
+                    if "id" in data or "comet_sections" in data:
+                        stories.append(data)
+                if "timeline_list_feed_units" in data:
+                    units = data["timeline_list_feed_units"] or {}
+                    for edge in units.get("edges", []):
+                        node = edge.get("node")
+                        if node:
+                            stories.append(node)
+                if "profile_pinned_post" in data:
+                    pinned = data["profile_pinned_post"] or {}
+                    node = pinned.get("pinned_post_story")
+                    if node:
+                        stories.append(node)
+                for k, v in data.items():
+                    stories.extend(search_for_stories(v))
+            elif isinstance(data, list):
+                for item in data:
+                    stories.extend(search_for_stories(item))
+            return stories
+
+        def find_field_value(d, field_name):
+            if isinstance(d, dict):
+                if field_name in d:
+                    return d[field_name]
+                for k, v in d.items():
+                    res = find_field_value(v, field_name)
+                    if res is not None:
+                        return res
+            elif isinstance(d, list):
+                for item in d:
+                    res = find_field_value(item, field_name)
+                    if res is not None:
+                        return res
+            return None
+
+        def find_images(d):
+            imgs = []
+            if isinstance(d, dict):
+                if "photo_image" in d and isinstance(d["photo_image"], dict) and "uri" in d["photo_image"]:
+                    imgs.append(d["photo_image"]["uri"])
+                if "media" in d and isinstance(d["media"], dict):
+                    media_obj = d["media"]
+                    if "image" in media_obj and isinstance(media_obj["image"], dict) and "uri" in media_obj["image"]:
+                        imgs.append(media_obj["image"]["uri"])
+                    if "photo_image" in media_obj and isinstance(media_obj["photo_image"], dict) and "uri" in media_obj["photo_image"]:
+                        imgs.append(media_obj["photo_image"]["uri"])
+                for k, v in d.items():
+                    if k not in ["profile_picture", "actors", "actor_photo"]:
+                        imgs.extend(find_images(v))
+            elif isinstance(d, list):
+                for item in d:
+                    imgs.extend(find_images(item))
+            return imgs
+
+        def find_valid_url(d):
+            if isinstance(d, dict):
+                if "url" in d and d["url"] and any(p in d["url"] for p in ["posts", "permalink", "photo", "story"]):
+                    return d["url"]
+                for k, v in d.items():
+                    res = find_valid_url(v)
+                    if res:
+                        return res
+            elif isinstance(d, list):
+                for item in d:
+                    res = find_valid_url(item)
+                    if res:
+                        return res
+            return ""
+
+        def count_captured_posts(html, g_data):
+            json_blobs = []
+            if html:
+                all_script_blocks = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html)
+                for sb in all_script_blocks:
+                    try:
+                        json_blobs.append(json.loads(sb))
+                    except Exception:
+                        pass
+            for g_text in g_data:
+                for line in g_text.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    try:
+                        json_blobs.append(json.loads(line))
+                    except Exception:
+                        pass
+            
+            all_story_nodes = []
+            for blob in json_blobs:
+                all_story_nodes.extend(search_for_stories(blob))
+                
+            extracted_posts = {}
+            for node in all_story_nodes:
+                comet_sections = node.get("comet_sections", {})
+                if not comet_sections and isinstance(node, dict):
+                    story = node.get("story")
+                    if isinstance(story, dict):
+                        node = story
+                        comet_sections = node.get("comet_sections", {})
+                
+                message_text = ""
+                if comet_sections:
+                    msg_obj = find_field_value(comet_sections, "message")
+                    if isinstance(msg_obj, dict):
+                        message_text = msg_obj.get("text") or ""
+                if not message_text:
+                    msg_obj = find_field_value(node, "message")
+                    if isinstance(msg_obj, dict):
+                        message_text = msg_obj.get("text") or ""
+                
+                images = find_images(node)
+                if not message_text and not images:
+                    continue
+                    
+                url = ""
+                if comet_sections:
+                    url = find_field_value(comet_sections, "url")
+                if not url:
+                    url = find_valid_url(node)
+
+                post_id = node.get("id") or ""
+                url_post_id = ""
+                if url:
+                    if "/posts/" in url:
+                        url_post_id = url.split("/posts/")[-1].split("?")[0].strip("/")
+                    elif "fbid=" in url:
+                        parsed = urlparse.urlparse(url)
+                        queries = urlparse.parse_qs(parsed.query)
+                        if "fbid" in queries:
+                            url_post_id = queries["fbid"][0]
+                    elif "/photos/" in url:
+                        parts = url.split("/photos/")[-1].split("/")
+                        if len(parts) >= 2:
+                            url_post_id = parts[1]
+                            
+                dedup_key = url_post_id or post_id
+                if not dedup_key:
+                    continue
+                extracted_posts[dedup_key] = True
+            return len(extracted_posts)
+
+        # Initialize progress and task as None to avoid linter unbound warning
+        progress = None
+        task = None
 
         def scroll_action(page):
             # Intercept response
@@ -113,24 +264,103 @@ class FacebookPostScraper(BaseTool):
                         text = response.text()
                         if "timeline_list_feed_units" in text or "feedUnit" in text or "comet_sections" in text:
                             graphql_data.append(text)
+                            # Print detailed CLI output when fetching data
+                            console.print(f"[bold green]✓[/bold green] [cyan]Captured GraphQL packet ({len(text)} bytes) from Facebook.[/cyan]")
                     except Exception:
                         pass
             page.on("response", on_response)
 
             # Wait for feed to load initially
+            console.print("[cyan]Waiting for initial feed elements to render...[/cyan]")
+            if progress and task:
+                progress.update(task, description="[cyan]Waiting for initial feed elements...[/cyan]")
             try:
-                page.wait_for_selector('div[data-ad-preview="message"]', timeout=10000)
+                page.wait_for_selector('div[data-ad-preview="message"]', timeout=12000)
             except Exception:
                 page.wait_for_timeout(3000)
 
-            # Scroll down dynamically based on limit
-            for i in range(num_scrolls):
+            last_height = page.evaluate("document.body.scrollHeight")
+            scroll_count = 0
+            
+            # Estimate required scrolls based on limit
+            target_scrolls = math.ceil(limit / 5)
+            target_scrolls = max(1, target_scrolls)
+            
+            console.print(f"[green]Initial page loaded successfully. Starting dynamic scroll process.[/green]")
+            console.print(f"[dim]Target scrolls: ~{target_scrolls} (stops early if height doesn't increase)[/dim]\n")
+
+            while scroll_count < target_scrolls:
+                scroll_count += 1
+                console.print(f"[bold blue]>>> Scroll #{scroll_count} of ~{target_scrolls}[/bold blue]")
+                console.print(f"[cyan]Scrolling to bottom... (Current Height: {last_height}px)[/cyan]")
+                if progress and task:
+                    progress.update(task, description=f"[cyan]Scrolling #{scroll_count} (Height: {last_height}px)...[/cyan]")
+                
+                # Perform scroll
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(2500)
+                
+                # Wait 4 seconds for content/height update to start and fetch any lazy-loaded content
+                if progress and task:
+                    progress.update(task, description=f"[cyan]Fetching content/waiting for network (Scroll #{scroll_count})...[/cyan]")
+                page.wait_for_timeout(4000)
+                
+                new_height = page.evaluate("document.body.scrollHeight")
+                
+                # Verify if height actually increased
+                if new_height == last_height:
+                    # Let's perform a scroll nudge: scroll up slightly and then down again, wait to be sure
+                    console.print(f"[yellow]⚠ Height unchanged ({new_height}px). Nudging scroll to trigger lazy load...[/yellow]")
+                    if progress and task:
+                        progress.update(task, description="[yellow]Nudging scroll to trigger lazy load...[/yellow]")
+                    
+                    page.evaluate("window.scrollBy(0, -600)")
+                    page.wait_for_timeout(1500)
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(4000)
+                    
+                    new_height = page.evaluate("document.body.scrollHeight")
+                
+                console.print(f"[dim]Page height position: {last_height}px -> {new_height}px[/dim]")
+                
+                # If height did not increase even after nudge, stop automatically
+                if new_height == last_height:
+                    console.print("[bold green]Reached the end of the feed (bottom of page). Stopping scroll.[/bold green]")
+                    break
+                
+                # Update position tracker
+                last_height = new_height
+                
+                # Show Position Reminder
+                current_html = page.content()
+                current_count = count_captured_posts(current_html, graphql_data)
+                console.print(f"[magenta]ℹ Position Reminder: Height = {new_height}px | Collected Packets = {len(graphql_data)} | Approx. Unique Posts = {current_count}/{limit}[/magenta]")
+                
+                # If we have reached or exceeded the required limit, we can stop early!
+                if current_count >= limit:
+                    console.print(f"[bold green]✓ Target post limit ({limit}) reached/exceeded ({current_count} posts). Stopping scroll.[/bold green]")
+                    break
+                
+                if scroll_count >= target_scrolls:
+                    break
+                    
+                # Delay between 60 and 180 seconds (1-3 minutes)
+                delay = random.randint(60, 180)
+                console.print(f"[yellow]⏱ Anti-bot pause: Next scroll queued in {delay} seconds (randomized 1-3 minutes)...[/yellow]")
+                
+                # Countdown display using rich.progress task description
+                for remaining in range(delay, 0, -1):
+                    mins, secs = divmod(remaining, 60)
+                    time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+                    if progress and task:
+                        progress.update(task, description=f"[yellow]⏱ Waiting: {time_str} remaining...[/yellow]")
+                    time.sleep(1)
+                
+                if progress and task:
+                    progress.update(task, description="[green]✓ Pause finished. Resuming...[/green]")
+                console.print("[green]✓ Pause finished. Resuming scroll...[/green]\n")
 
         posts = []
         console.print(f"\n[yellow]Starting headless browser session for target: [bold]{target}[/bold]...[/yellow]")
-        console.print(f"[dim]Performing {num_scrolls} scrolling operations to load dynamic feed content and intercept GraphQL payloads...[/dim]")
 
         # Progress bar/spinner for the browser loading phase
         with Progress(
@@ -172,70 +402,11 @@ class FacebookPostScraper(BaseTool):
                 except Exception:
                     pass
 
-        def search_for_stories(data):
-            stories = []
-            if isinstance(data, dict):
-                typename = data.get("__typename")
-                if typename in ["Story", "FeedUnit"] or "comet_sections" in data:
-                    if "id" in data or "comet_sections" in data:
-                        stories.append(data)
-                if "timeline_list_feed_units" in data:
-                    units = data["timeline_list_feed_units"] or {}
-                    for edge in units.get("edges", []):
-                        node = edge.get("node")
-                        if node:
-                            stories.append(node)
-                if "profile_pinned_post" in data:
-                    pinned = data["profile_pinned_post"] or {}
-                    node = pinned.get("pinned_post_story")
-                    if node:
-                        stories.append(node)
-                for k, v in data.items():
-                    stories.extend(search_for_stories(v))
-            elif isinstance(data, list):
-                for item in data:
-                    stories.extend(search_for_stories(item))
-            return stories
-
         all_story_nodes = []
         for blob in json_blobs:
             all_story_nodes.extend(search_for_stories(blob))
 
         extracted_posts = {}
-
-        def find_field_value(d, field_name):
-            if isinstance(d, dict):
-                if field_name in d:
-                    return d[field_name]
-                for k, v in d.items():
-                    res = find_field_value(v, field_name)
-                    if res is not None:
-                        return res
-            elif isinstance(d, list):
-                for item in d:
-                    res = find_field_value(item, field_name)
-                    if res is not None:
-                        return res
-            return None
-
-        def find_images(d):
-            imgs = []
-            if isinstance(d, dict):
-                if "photo_image" in d and isinstance(d["photo_image"], dict) and "uri" in d["photo_image"]:
-                    imgs.append(d["photo_image"]["uri"])
-                if "media" in d and isinstance(d["media"], dict):
-                    media_obj = d["media"]
-                    if "image" in media_obj and isinstance(media_obj["image"], dict) and "uri" in media_obj["image"]:
-                        imgs.append(media_obj["image"]["uri"])
-                    if "photo_image" in media_obj and isinstance(media_obj["photo_image"], dict) and "uri" in media_obj["photo_image"]:
-                        imgs.append(media_obj["photo_image"]["uri"])
-                for k, v in d.items():
-                    if k not in ["profile_picture", "actors", "actor_photo"]:
-                        imgs.extend(find_images(v))
-            elif isinstance(d, list):
-                for item in d:
-                    imgs.extend(find_images(item))
-            return imgs
 
         for node in all_story_nodes:
             comet_sections = node.get("comet_sections", {})
@@ -267,20 +438,6 @@ class FacebookPostScraper(BaseTool):
                 if url and not any(p in url for p in ["posts", "permalink", "photo", "story"]):
                     url = ""
             if not url:
-                def find_valid_url(d):
-                    if isinstance(d, dict):
-                        if "url" in d and d["url"] and any(p in d["url"] for p in ["posts", "permalink", "photo", "story"]):
-                            return d["url"]
-                        for k, v in d.items():
-                            res = find_valid_url(v)
-                            if res:
-                                return res
-                    elif isinstance(d, list):
-                        for item in d:
-                            res = find_valid_url(item)
-                            if res:
-                                return res
-                    return ""
                 url = find_valid_url(node)
 
             post_id = node.get("id") or ""
@@ -408,7 +565,7 @@ class FacebookPostScraper(BaseTool):
         if export_format in ["CSV", "Both"]:
             with open(csv_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Post ID", "Timestamp", "Content", "Story Link", "Images"])
+                writer.writerow(["Post ID", "Timestamp", "Content", "Story Link", "File Attached"])
                 for post in posts:
                     writer.writerow([
                         post["post_id"],
