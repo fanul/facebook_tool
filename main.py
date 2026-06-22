@@ -57,7 +57,8 @@ def manage_auth(config: dict):
         "What would you like to do?",
         choices=[
             "Test current session connection",
-            "Set new session cookies (Raw string or JSON)",
+            "Set new session cookies (Paste raw string or JSON)",
+            "Load session cookies from a file (JSON or TXT)",
             "Clear current session cookies",
             "Back to main menu"
         ]
@@ -74,7 +75,7 @@ def manage_auth(config: dict):
         else:
             console.print(f"[bold red]❌ Failed: {msg}[/bold red]")
             
-    elif action == "Set new session cookies (Raw string or JSON)":
+    elif action == "Set new session cookies (Paste raw string or JSON)":
         console.print("[blue]Please paste your Facebook cookie string or JSON structure:[/blue]")
         console.print("[dim]Tip: It supports JSON exports (e.g. EditThisCookie list structure) as well as raw key=value strings.[/dim]")
         raw_cookie = questionary.text("Cookie string or JSON:").ask()
@@ -97,6 +98,44 @@ def manage_auth(config: dict):
                         console.print("[green]Cookies saved anyway.[/green]")
             else:
                 console.print("[bold red]Failed to parse valid Facebook cookies. Make sure it contains 'c_user' and 'xs' keys.[/bold red]")
+
+    elif action == "Load session cookies from a file (JSON or TXT)":
+        file_path = questionary.text(
+            "Enter path to your cookie file:",
+            default="cookies.json"
+        ).ask()
+        
+        if not file_path:
+            return
+            
+        if not os.path.exists(file_path):
+            console.print(f"[bold red]Error: File not found at '{file_path}'[/bold red]")
+            return
+            
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            parsed = parse_cookie_string(content)
+            if parsed and ("c_user" in parsed or "xs" in parsed):
+                console.print(f"[yellow]Parsed {len(parsed)} cookies from file. Testing connection...[/yellow]")
+                is_ok, msg = check_facebook_login(parsed, config.get("settings", {}).get("user_agent"))
+                if is_ok:
+                    config["active_cookies"] = parsed
+                    save_config(config)
+                    console.print(f"[bold green]✔ Success: {msg}[/bold green]")
+                    console.print("[green]Cookies successfully loaded and saved to config.json[/green]")
+                else:
+                    console.print(f"[bold red]❌ Validation failed: {msg}[/bold red]")
+                    confirm_save = questionary.confirm("Do you still want to save these cookies?").ask()
+                    if confirm_save:
+                        config["active_cookies"] = parsed
+                        save_config(config)
+                        console.print("[green]Cookies saved anyway.[/green]")
+            else:
+                console.print("[bold red]Failed to parse valid Facebook cookies from file. Make sure it contains 'c_user' and 'xs' keys.[/bold red]")
+        except Exception as e:
+            console.print(f"[bold red]Error reading file: {e}[/bold red]")
 
     elif action == "Clear current session cookies":
         if questionary.confirm("Are you sure you want to clear active cookies?").ask():
