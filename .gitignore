@@ -1,0 +1,23 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Sensitive Configuration (contains Facebook session cookies)
+config.json
+
+# Scraped Data Exports
+exports/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
