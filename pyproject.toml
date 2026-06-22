@@ -11,4 +11,5 @@ dependencies = [
     "curl-cffi>=0.15.0",
     "playwright>=1.40.0",
     "browserforge>=1.0.0",
+    "requests>=2.31.0",
 ]
