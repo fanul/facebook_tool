@@ -157,22 +157,52 @@ def manage_settings(config: dict):
     default_export_dir = settings.get("default_export_dir", "exports")
     request_delay_seconds = settings.get("request_delay_seconds", 2.0)
     user_agent = settings.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0")
+    default_max_wait = settings.get("max_scroll_wait_seconds", 180)
+    default_freq_min = settings.get("scroll_freq_min", 1)
+    default_freq_max = settings.get("scroll_freq_max", 3)
 
     new_dir = questionary.text("Default export folder path:", default=str(default_export_dir)).ask()
     new_delay_str = questionary.text("Delay between page requests (seconds):", default=str(request_delay_seconds)).ask()
     new_ua = questionary.text("User-Agent header:", default=str(user_agent)).ask()
+    new_max_wait_str = questionary.text("Max scroll wait time (seconds):", default=str(default_max_wait)).ask()
+    new_freq_min_str = questionary.text("Scroll frequency lower bound (min scrolls before waiting):", default=str(default_freq_min)).ask()
+    new_freq_max_str = questionary.text("Scroll frequency upper bound (max scrolls before waiting):", default=str(default_freq_max)).ask()
 
     try:
         new_delay = float(new_delay_str)
     except ValueError:
         new_delay = 2.0
 
+    try:
+        new_max_wait = int(new_max_wait_str)
+    except ValueError:
+        new_max_wait = 180
+
+    try:
+        new_freq_min = int(new_freq_min_str)
+    except ValueError:
+        new_freq_min = 1
+
+    try:
+        new_freq_max = int(new_freq_max_str)
+    except ValueError:
+        new_freq_max = 3
+
+    if new_freq_min < 1:
+        new_freq_min = 1
+    if new_freq_max < new_freq_min:
+        new_freq_max = new_freq_min
+
     settings["default_export_dir"] = new_dir
     settings["request_delay_seconds"] = new_delay
     settings["user_agent"] = new_ua
+    settings["max_scroll_wait_seconds"] = new_max_wait
+    settings["scroll_freq_min"] = new_freq_min
+    settings["scroll_freq_max"] = new_freq_max
     
     save_config(config)
     console.print("[bold green]Settings updated and saved successfully.[/bold green]")
+
 
 def main():
     config = load_config()

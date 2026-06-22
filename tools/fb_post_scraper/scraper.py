@@ -83,12 +83,71 @@ class FacebookPostScraper(BaseTool):
                     if "?" in target:
                         target = target.split("?", 1)[0]
 
-        # Prompt for limit
-        limit_str = questionary.text("Enter max number of posts to scrape:", default="10").ask()
+        # Prompt for limit (supports -1 or negative for all posts)
+        limit_str = questionary.text("Enter max number of posts to scrape (use -1 or negative for all posts):", default="10").ask()
         try:
             limit = int(limit_str)
         except ValueError:
             limit = 10
+
+        scrape_all = limit <= 0
+        if scrape_all:
+            display_limit = "All"
+            slice_limit = 999999
+        else:
+            display_limit = str(limit)
+            slice_limit = limit
+
+        # Load scroll settings from config with defaults
+        settings = config.get("settings", {})
+        default_max_wait = settings.get("max_scroll_wait_seconds", 180)
+        default_freq_min = settings.get("scroll_freq_min", 1)
+        default_freq_max = settings.get("scroll_freq_max", 3)
+
+        # Prompt for scroll settings
+        max_wait_str = questionary.text(
+            "Enter max anti-bot waiting time (seconds, 0 to disable wait):",
+            default=str(default_max_wait)
+        ).ask()
+        try:
+            max_scroll_wait = int(max_wait_str)
+        except ValueError:
+            max_scroll_wait = 180
+
+        freq_min_str = questionary.text(
+            "Enter scroll frequency lower bound (min scrolls before waiting):",
+            default=str(default_freq_min)
+        ).ask()
+        try:
+            scroll_freq_min = int(freq_min_str)
+        except ValueError:
+            scroll_freq_min = 1
+
+        freq_max_str = questionary.text(
+            "Enter scroll frequency upper bound (max scrolls before waiting):",
+            default=str(default_freq_max)
+        ).ask()
+        try:
+            scroll_freq_max = int(freq_max_str)
+        except ValueError:
+            scroll_freq_max = 3
+
+        # Ensure scroll freq bounds are valid
+        if scroll_freq_min < 1:
+            scroll_freq_min = 1
+        if scroll_freq_max < scroll_freq_min:
+            scroll_freq_max = scroll_freq_min
+
+        # Save settings back to config.json
+        settings["max_scroll_wait_seconds"] = max_scroll_wait
+        settings["scroll_freq_min"] = scroll_freq_min
+        settings["scroll_freq_max"] = scroll_freq_max
+        config["settings"] = settings
+        try:
+            with open("config.json", 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
         # Prompt for export format
         export_format = questionary.select(
@@ -283,15 +342,23 @@ class FacebookPostScraper(BaseTool):
             scroll_count = 0
             
             # Estimate required scrolls based on limit
-            target_scrolls = math.ceil(limit / 5)
-            target_scrolls = max(1, target_scrolls)
+            if scrape_all:
+                target_scrolls = 9999
+            else:
+                target_scrolls = math.ceil(slice_limit / 5)
+                target_scrolls = max(1, target_scrolls)
             
             console.print(f"[green]Initial page loaded successfully. Starting dynamic scroll process.[/green]")
-            console.print(f"[dim]Target scrolls: ~{target_scrolls} (stops early if height doesn't increase)[/dim]\n")
+            console.print(f"[dim]Target scrolls: ~{target_scrolls if not scrape_all else 'Unlimited'} (stops early if height doesn't increase or limit met)[/dim]\n")
+
+            # Determine the first scroll frequency wait target
+            scrolls_to_next_wait = random.randint(scroll_freq_min, scroll_freq_max)
+            next_wait_scroll = scroll_count + scrolls_to_next_wait
+            console.print(f"[dim]Anti-bot plan: Will perform randomized pause after {scrolls_to_next_wait} scrolls (Scroll #{next_wait_scroll})[/dim]")
 
             while scroll_count < target_scrolls:
                 scroll_count += 1
-                console.print(f"[bold blue]>>> Scroll #{scroll_count} of ~{target_scrolls}[/bold blue]")
+                console.print(f"[bold blue]>>> Scroll #{scroll_count} of ~{target_scrolls if not scrape_all else 'Unlimited'}[/bold blue]")
                 console.print(f"[cyan]Scrolling to bottom... (Current Height: {last_height}px)[/cyan]")
                 if progress and task:
                     progress.update(task, description=f"[cyan]Scrolling #{scroll_count} (Height: {last_height}px)...[/cyan]")
@@ -333,31 +400,50 @@ class FacebookPostScraper(BaseTool):
                 # Show Position Reminder
                 current_html = page.content()
                 current_count = count_captured_posts(current_html, graphql_data)
-                console.print(f"[magenta]ℹ Position Reminder: Height = {new_height}px | Collected Packets = {len(graphql_data)} | Approx. Unique Posts = {current_count}/{limit}[/magenta]")
+                console.print(f"[magenta]ℹ Position Reminder: Height = {new_height}px | Collected Packets = {len(graphql_data)} | Approx. Unique Posts = {current_count}/{display_limit}[/magenta]")
                 
                 # If we have reached or exceeded the required limit, we can stop early!
-                if current_count >= limit:
-                    console.print(f"[bold green]✓ Target post limit ({limit}) reached/exceeded ({current_count} posts). Stopping scroll.[/bold green]")
+                if not scrape_all and current_count >= slice_limit:
+                    console.print(f"[bold green]✓ Target post limit ({slice_limit}) reached/exceeded ({current_count} posts). Stopping scroll.[/bold green]")
                     break
                 
                 if scroll_count >= target_scrolls:
                     break
                     
-                # Delay between 60 and 180 seconds (1-3 minutes)
-                delay = random.randint(60, 180)
-                console.print(f"[yellow]⏱ Anti-bot pause: Next scroll queued in {delay} seconds (randomized 1-3 minutes)...[/yellow]")
-                
-                # Countdown display using rich.progress task description
-                for remaining in range(delay, 0, -1):
-                    mins, secs = divmod(remaining, 60)
-                    time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-                    if progress and task:
-                        progress.update(task, description=f"[yellow]⏱ Waiting: {time_str} remaining...[/yellow]")
-                    time.sleep(1)
-                
-                if progress and task:
-                    progress.update(task, description="[green]✓ Pause finished. Resuming...[/green]")
-                console.print("[green]✓ Pause finished. Resuming scroll...[/green]\n")
+                # Perform anti-bot pause if we hit our random scroll frequency target
+                if scroll_count == next_wait_scroll:
+                    # Determine next target scroll count first
+                    scrolls_to_next_wait = random.randint(scroll_freq_min, scroll_freq_max)
+                    next_wait_scroll = scroll_count + scrolls_to_next_wait
+                    
+                    if max_scroll_wait > 0:
+                        delay = random.randint(0, max_scroll_wait)
+                        if delay > 0:
+                            console.print(f"[yellow]⏱ Anti-bot pause: Next scroll queued in {delay} seconds (randomized 0-{max_scroll_wait}s)...[/yellow]")
+                            console.print(f"[dim]Next randomized pause scheduled after {scrolls_to_next_wait} more scrolls (Scroll #{next_wait_scroll})[/dim]")
+                            
+                            # Countdown display showing elapsed and remaining seconds
+                            for elapsed in range(1, delay + 1):
+                                remaining = delay - elapsed
+                                if progress and task:
+                                    progress.update(
+                                        task, 
+                                        description=f"[yellow]⏱ Waiting: {elapsed}s elapsed | {remaining}s remaining (total {delay}s)...[/yellow]"
+                                    )
+                                time.sleep(1)
+                            
+                            if progress and task:
+                                progress.update(task, description="[green]✓ Pause finished. Resuming...[/green]")
+                            console.print("[green]✓ Pause finished. Resuming scroll...[/green]\n")
+                        else:
+                            console.print("[dim]⏱ Anti-bot pause selected 0 seconds delay. Resuming immediately...[/dim]")
+                            console.print(f"[dim]Next randomized pause scheduled after {scrolls_to_next_wait} more scrolls (Scroll #{next_wait_scroll})[/dim]\n")
+                    else:
+                        console.print("[dim]⏱ Anti-bot pauses disabled (max wait time is 0). Resuming immediately...[/dim]\n")
+                else:
+                    # No wait on this scroll
+                    scrolls_left = next_wait_scroll - scroll_count
+                    console.print(f"[dim]No pause this scroll. Next pause in {scrolls_left} scrolls (Scroll #{next_wait_scroll})[/dim]\n")
 
         posts = []
         console.print(f"\n[yellow]Starting headless browser session for target: [bold]{target}[/bold]...[/yellow]")
@@ -521,7 +607,7 @@ class FacebookPostScraper(BaseTool):
             final_posts.append(p)
 
         # Slice to requested limit
-        final_posts = final_posts[:limit]
+        final_posts = final_posts[:slice_limit]
 
         # Convert timestamps for presentation
         for p in final_posts:
