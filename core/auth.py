@@ -1,5 +1,6 @@
 import json
 import re
+import urllib.parse
 from scrapling import Fetcher
 
 def parse_cookie_string(cookie_str: str) -> dict:
@@ -8,7 +9,8 @@ def parse_cookie_string(cookie_str: str) -> dict:
     1. JSON List of cookie dicts (e.g. from browser extension exports like EditThisCookie).
     2. JSON Object/Dict of key-value pairs.
     3. Raw cookie strings (e.g. key1=val1; key2=val2).
-    It also sanitizes newlines and spaces introduced by terminal copy-paste actions.
+    It also sanitizes newlines and spaces introduced by terminal copy-paste actions
+    and automatically decodes URL-encoded values (like colons in xs).
     """
     cookies = {}
     if not cookie_str:
@@ -22,10 +24,10 @@ def parse_cookie_string(cookie_str: str) -> dict:
         if isinstance(parsed_json, list):
             for item in parsed_json:
                 if isinstance(item, dict) and "name" in item and "value" in item:
-                    result[item["name"]] = str(item["value"])
+                    result[item["name"]] = urllib.parse.unquote(str(item["value"]))
         elif isinstance(parsed_json, dict):
             for k, v in parsed_json.items():
-                result[k] = str(v)
+                result[k] = urllib.parse.unquote(str(v))
         return result
 
     # 1. Try parsing as standard JSON
@@ -54,9 +56,9 @@ def parse_cookie_string(cookie_str: str) -> dict:
     for pair in pairs:
         if '=' in pair:
             key, val = pair.split('=', 1)
-            # Remove any internal spaces introduced by word-wrapping
+            # Remove any internal spaces introduced by word-wrapping and decode
             clean_key = key.replace(' ', '').strip()
-            clean_val = val.replace(' ', '').strip()
+            clean_val = urllib.parse.unquote(val.replace(' ', '').strip())
             if clean_key:
                 cookies[clean_key] = clean_val
     return cookies
