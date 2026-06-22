@@ -60,19 +60,33 @@ def check_facebook_login(cookies: dict, user_agent: str = None) -> tuple[bool, s
         response = Fetcher.get(url, cookies=cookies, headers=headers)
         
         # Check redirects or login indicators
-        final_url = response.url
-        if "login" in final_url or "login.php" in final_url:
-            return False, f"Session expired or redirected to login: {final_url}"
+        final_url = response.url.lower()
+        
+        # If redirected to a login or checkpoint page, validation failed
+        if "login" in final_url or "login.php" in final_url or "checkpoint" in final_url:
+            return False, f"Session expired or redirected to login/checkpoint: {response.url}"
             
-        # Check HTML content for login form or logout link
+        # Inspect HTML for a login form (email and password inputs)
+        has_email_input = response.css('input[name="email"]').get() is not None
+        has_pass_input = response.css('input[name="pass"]').get() is not None
+        if has_email_input and has_pass_input:
+            return False, "Cookies are invalid (redirected to a login form)."
+
+        # Check for logout links or bookmark menus (mbasic)
         logout_link = response.css('a[href*="logout.php"]').get()
         login_form = response.css('form[action*="login"]').get()
         
         if login_form and not logout_link:
-            return False, "Detected login form on the page. Cookies might be invalid."
+            return False, "Detected login form container on the page. Cookies might be invalid."
             
         if logout_link or response.css('a[href*="menu/bookmark"]').get():
             return True, "Successfully authenticated with Facebook!"
+            
+        # Check if we were redirected to the main desktop home page/feed (which is a success indicator)
+        if "facebook.com/home.php" in final_url or (
+            "facebook.com" in final_url and ("_rdr" in final_url or "ref" in final_url)
+        ):
+            return True, "Successfully authenticated with Facebook (redirected to home feed)!"
             
         # Fallback check: check for common links
         if response.css('a[href*="/messages/"]').get() or response.css('a[href*="/notifications.php"]').get():
@@ -83,6 +97,10 @@ def check_facebook_login(cookies: dict, user_agent: str = None) -> tuple[bool, s
         if "logout" in text_lower or "log out" in text_lower or "keluar" in text_lower:
             return True, "Successfully authenticated with Facebook!"
             
+        # If we successfully loaded the home page without any login page indicators:
+        if "home.php" in final_url or final_url == "https://mbasic.facebook.com/" or final_url == "https://www.facebook.com/":
+            return True, "Successfully authenticated with Facebook (no login form detected)!"
+
         return False, "Could not confirm login status. The cookies might be invalid or restricted."
     except Exception as e:
         return False, f"Error connecting to Facebook: {str(e)}"
