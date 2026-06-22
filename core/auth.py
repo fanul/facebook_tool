@@ -1,7 +1,8 @@
 import json
 import re
 import urllib.parse
-from scrapling import Fetcher
+import requests
+from scrapling import Selector
 
 def parse_cookie_string(cookie_str: str) -> dict:
     """
@@ -72,35 +73,51 @@ def check_facebook_login(cookies: dict, user_agent: str = None) -> tuple[bool, s
         return False, "Cookies are empty."
         
     url = "https://mbasic.facebook.com/home.php"
-    headers = {}
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
     if user_agent:
         headers["User-Agent"] = user_agent
         
     try:
-        # Use scrapling Fetcher for a quick lightweight HTTP check
-        response = Fetcher.get(url, cookies=cookies, headers=headers)
+        # Use requests to fetch page as it handles cookie domains and redirects more robustly
+        session = requests.Session()
+        session.headers.update(headers)
         
-        # Check redirects or login indicators
+        # Decode cookie values
+        decoded_cookies = {k: urllib.parse.unquote(v) for k, v in cookies.items()}
+        response = session.get(url, cookies=decoded_cookies)
+        
         final_url = response.url.lower()
         
         # If redirected to a login or checkpoint page, validation failed
         if "login" in final_url or "login.php" in final_url or "checkpoint" in final_url:
             return False, f"Session expired or redirected to login/checkpoint: {response.url}"
             
+        # Wrap response in Scrapling Selector for consistent parsing
+        # Use response.content (bytes) to avoid lxml encoding declaration errors
+        selector = Selector(response.content)
+            
         # Inspect HTML for a login form (email and password inputs)
-        has_email_input = response.css('input[name="email"]').get() is not None
-        has_pass_input = response.css('input[name="pass"]').get() is not None
+        has_email_input = selector.css('input[name="email"]').get() is not None
+        has_pass_input = selector.css('input[name="pass"]').get() is not None
         if has_email_input and has_pass_input:
             return False, "Cookies are invalid (redirected to a login form)."
 
         # Check for logout links or bookmark menus (mbasic)
-        logout_link = response.css('a[href*="logout.php"]').get()
-        login_form = response.css('form[action*="login"]').get()
+        logout_link = selector.css('a[href*="logout.php"]').get()
+        login_form = selector.css('form[action*="login"]').get()
         
         if login_form and not logout_link:
             return False, "Detected login form container on the page. Cookies might be invalid."
             
-        if logout_link or response.css('a[href*="menu/bookmark"]').get():
+        if logout_link or selector.css('a[href*="menu/bookmark"]').get():
             return True, "Successfully authenticated with Facebook!"
             
         # Check if we were redirected to the main desktop home page/feed (which is a success indicator)
@@ -110,7 +127,7 @@ def check_facebook_login(cookies: dict, user_agent: str = None) -> tuple[bool, s
             return True, "Successfully authenticated with Facebook (redirected to home feed)!"
             
         # Fallback check: check for common links
-        if response.css('a[href*="/messages/"]').get() or response.css('a[href*="/notifications.php"]').get():
+        if selector.css('a[href*="/messages/"]').get() or selector.css('a[href*="/notifications.php"]').get():
             return True, "Successfully authenticated with Facebook!"
             
         # Fallback check 2: text search
