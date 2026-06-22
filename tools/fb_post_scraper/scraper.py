@@ -2,6 +2,8 @@ import os
 import json
 import csv
 import time
+import re
+import urllib.parse as urlparse
 from datetime import datetime
 from rich.console import Console
 from rich.panel import Panel
@@ -55,7 +57,6 @@ class FacebookPostScraper(BaseTool):
             # https://www.facebook.com/people/Some-Name/10008323621/
             if "profile.php" in target_input:
                 # Extract id query param
-                import urllib.parse as urlparse
                 parsed_url = urlparse.urlparse(target_input)
                 queries = urlparse.parse_qs(parsed_url.query)
                 if "id" in queries:
@@ -92,157 +93,291 @@ class FacebookPostScraper(BaseTool):
             choices=["JSON", "CSV", "Both"]
         ).ask()
 
-        # Build initial URL
+        # Build initial URL (Desktop version)
         if target.isdigit():
-            base_url = f"https://mbasic.facebook.com/profile.php?id={target}"
+            base_url = f"https://www.facebook.com/profile.php?id={target}"
         else:
-            base_url = f"https://mbasic.facebook.com/{target}"
+            base_url = f"https://www.facebook.com/{target}"
 
         engine = ScrapingEngine(config)
-        delay = engine.get_delay()
+        graphql_data = []
+
+        # We'll scroll page_action to trigger GraphQL requests
+        num_scrolls = max(1, min(25, limit // 3))
+
+        def scroll_action(page):
+            # Intercept response
+            def on_response(response):
+                if "graphql" in response.url:
+                    try:
+                        text = response.text()
+                        if "timeline_list_feed_units" in text or "feedUnit" in text or "comet_sections" in text:
+                            graphql_data.append(text)
+                    except Exception:
+                        pass
+            page.on("response", on_response)
+
+            # Wait for feed to load initially
+            try:
+                page.wait_for_selector('div[data-ad-preview="message"]', timeout=10000)
+            except Exception:
+                page.wait_for_timeout(3000)
+
+            # Scroll down dynamically based on limit
+            for i in range(num_scrolls):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2500)
 
         posts = []
-        current_url = base_url
-        page_num = 1
+        console.print(f"\n[yellow]Starting headless browser session for target: [bold]{target}[/bold]...[/yellow]")
+        console.print(f"[dim]Performing {num_scrolls} scrolling operations to load dynamic feed content and intercept GraphQL payloads...[/dim]")
 
-        console.print(f"\n[yellow]Starting scrape for target: [bold]{target}[/bold]...[/yellow]")
-
-        # Progress bar
+        # Progress bar/spinner for the browser loading phase
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
             console=console
         ) as progress:
-            task = progress.add_task("[cyan]Scraping posts...", total=limit)
+            task = progress.add_task("[cyan]Scrolling and capturing feed data...", total=None)
+            
+            try:
+                selector = engine.fetch_page(base_url, page_action=scroll_action)
+            except Exception as e:
+                console.print(f"\n[bold red]Error fetching page: {e}[/bold red]")
+                return
 
-            while current_url and len(posts) < limit:
-                progress.update(task, description=f"[cyan]Scraping page {page_num}...")
+        # Inspect if session is valid or got redirected
+        if "login" in selector.url or "login.php" in selector.url:
+            console.print("\n[bold red]Session expired or blocked by Facebook. Redirected to login page.[/bold red]")
+            return
+
+        # Parse captured json data
+        console.print("[cyan]Parsing preloaded JSON blocks and GraphQL data...[/cyan]")
+        initial_html = selector.html_content if hasattr(selector, "html_content") else ""
+        all_script_blocks = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', initial_html)
+        
+        json_blobs = []
+        for sb in all_script_blocks:
+            try:
+                json_blobs.append(json.loads(sb))
+            except Exception:
+                pass
                 
+        for g_text in graphql_data:
+            for line in g_text.strip().split("\n"):
+                if not line.strip():
+                    continue
                 try:
-                    response = engine.fetch_page(current_url)
-                except Exception as e:
-                    console.print(f"\n[red]Error fetching page {page_num}: {e}[/red]")
-                    break
+                    json_blobs.append(json.loads(line))
+                except Exception:
+                    pass
 
-                # Inspect if session is valid or got redirected
-                if "login" in response.url or "login.php" in response.url:
-                    console.print("\n[bold red]Session expired or blocked by Facebook. Redirected to login page.[/bold red]")
-                    break
+        def search_for_stories(data):
+            stories = []
+            if isinstance(data, dict):
+                typename = data.get("__typename")
+                if typename in ["Story", "FeedUnit"] or "comet_sections" in data:
+                    if "id" in data or "comet_sections" in data:
+                        stories.append(data)
+                if "timeline_list_feed_units" in data:
+                    units = data["timeline_list_feed_units"] or {}
+                    for edge in units.get("edges", []):
+                        node = edge.get("node")
+                        if node:
+                            stories.append(node)
+                if "profile_pinned_post" in data:
+                    pinned = data["profile_pinned_post"] or {}
+                    node = pinned.get("pinned_post_story")
+                    if node:
+                        stories.append(node)
+                for k, v in data.items():
+                    stories.extend(search_for_stories(v))
+            elif isinstance(data, list):
+                for item in data:
+                    stories.extend(search_for_stories(item))
+            return stories
 
-                # Extract posts on this page
-                # In mbasic, posts are inside elements with data-ft attribute
-                post_elements = response.css('*[data-ft]')
+        all_story_nodes = []
+        for blob in json_blobs:
+            all_story_nodes.extend(search_for_stories(blob))
+
+        extracted_posts = {}
+
+        def find_field_value(d, field_name):
+            if isinstance(d, dict):
+                if field_name in d:
+                    return d[field_name]
+                for k, v in d.items():
+                    res = find_field_value(v, field_name)
+                    if res is not None:
+                        return res
+            elif isinstance(d, list):
+                for item in d:
+                    res = find_field_value(item, field_name)
+                    if res is not None:
+                        return res
+            return None
+
+        def find_images(d):
+            imgs = []
+            if isinstance(d, dict):
+                if "photo_image" in d and isinstance(d["photo_image"], dict) and "uri" in d["photo_image"]:
+                    imgs.append(d["photo_image"]["uri"])
+                if "media" in d and isinstance(d["media"], dict):
+                    media_obj = d["media"]
+                    if "image" in media_obj and isinstance(media_obj["image"], dict) and "uri" in media_obj["image"]:
+                        imgs.append(media_obj["image"]["uri"])
+                    if "photo_image" in media_obj and isinstance(media_obj["photo_image"], dict) and "uri" in media_obj["photo_image"]:
+                        imgs.append(media_obj["photo_image"]["uri"])
+                for k, v in d.items():
+                    if k not in ["profile_picture", "actors", "actor_photo"]:
+                        imgs.extend(find_images(v))
+            elif isinstance(d, list):
+                for item in d:
+                    imgs.extend(find_images(item))
+            return imgs
+
+        for node in all_story_nodes:
+            comet_sections = node.get("comet_sections", {})
+            if not comet_sections and isinstance(node, dict):
+                story = node.get("story")
+                if isinstance(story, dict):
+                    node = story
+                    comet_sections = node.get("comet_sections", {})
+            
+            message_text = ""
+            if comet_sections:
+                msg_obj = find_field_value(comet_sections, "message")
+                if isinstance(msg_obj, dict):
+                    message_text = msg_obj.get("text") or ""
+            if not message_text:
+                msg_obj = find_field_value(node, "message")
+                if isinstance(msg_obj, dict):
+                    message_text = msg_obj.get("text") or ""
+            
+            creation_time = None
+            if comet_sections:
+                creation_time = find_field_value(comet_sections, "creation_time")
+            if creation_time is None:
+                creation_time = find_field_value(node, "creation_time")
                 
-                if not post_elements:
-                    console.print(f"\n[yellow]No posts found on page {page_num}. Ending search.[/yellow]")
-                    break
+            url = ""
+            if comet_sections:
+                url = find_field_value(comet_sections, "url")
+                if url and not any(p in url for p in ["posts", "permalink", "photo", "story"]):
+                    url = ""
+            if not url:
+                def find_valid_url(d):
+                    if isinstance(d, dict):
+                        if "url" in d and d["url"] and any(p in d["url"] for p in ["posts", "permalink", "photo", "story"]):
+                            return d["url"]
+                        for k, v in d.items():
+                            res = find_valid_url(v)
+                            if res:
+                                return res
+                    elif isinstance(d, list):
+                        for item in d:
+                            res = find_valid_url(item)
+                            if res:
+                                return res
+                    return ""
+                url = find_valid_url(node)
 
-                new_posts_found = 0
-                for post_el in post_elements:
-                    if len(posts) >= limit:
-                        break
-
-                    # Get data-ft attribute
-                    data_ft_str = post_el.css('::attr(data-ft)').get()
-                    post_id = None
-                    if data_ft_str:
-                        try:
-                            data_ft = json.loads(data_ft_str)
-                            post_id = (
-                                data_ft.get('top_level_post_id') or 
-                                data_ft.get('mf_story_key') or 
-                                data_ft.get('story_fbid')
-                            )
-                        except Exception:
-                            pass
-
-                    # If no valid post_id was parsed, it might not be a top-level post container
-                    if not post_id:
-                        continue
-
-                    # Deduplicate by post_id
-                    if any(p['post_id'] == str(post_id) for p in posts):
-                        continue
-
-                    # Extract content text
-                    # Look for paragraph elements inside the post
-                    p_texts = post_el.css('p::text').getall()
-                    
-                    # Fallback to span elements if no p elements
-                    if not p_texts:
-                        # Grab all span text that isn't short or navigational
-                        spans = post_el.css('span::text').getall()
-                        p_texts = [s for s in spans if len(s.strip()) > 3]
-
-                    content = " ".join([t.strip() for t in p_texts if t.strip()])
-                    
-                    # Extract links (story links)
-                    links = post_el.css('a::attr(href)').getall()
-                    story_link = ""
-                    for href in links:
-                        if 'story.php' in href or 'permalink.php' in href or '/posts/' in href or 'photo.php' in href:
-                            if href.startswith('/'):
-                                story_link = f"https://mbasic.facebook.com{href}"
-                            else:
-                                story_link = href
-                            break
-                            
-                    # Extract images
-                    images = post_el.css('img::attr(src)').getall()
-                    post_images = []
-                    for img in images:
-                        # Exclude icons and generic tracking pixels
-                        if 'static.xx' not in img and 'rsrc.php' not in img and img.startswith('http'):
-                            post_images.append(img)
-                            
-                    # Extract post time
-                    timestamp_text = post_el.css('abbr::text').get() or ""
-
-                    # Skip empty posts
-                    if not content and not post_images:
-                        continue
-
-                    posts.append({
-                        "post_id": str(post_id),
-                        "content": content,
-                        "timestamp": timestamp_text,
-                        "story_link": story_link,
-                        "images": post_images,
-                        "scraped_at": datetime.now().isoformat()
-                    })
-                    new_posts_found += 1
-                    progress.update(task, advance=1)
-
-                # Find pagination link
-                next_url = None
-                for a in response.css('a'):
-                    href = a.css('::attr(href)').get() or ''
-                    text = a.css('::text').get() or ''
-                    
-                    # Reliable parameters for facebook pagination
-                    if 'cursor=' in href or 'bac=' in href or 'section_index=' in href or 'unit_cursor=' in href:
-                        if href.startswith('/'):
-                            next_url = f"https://mbasic.facebook.com{href}"
-                        else:
-                            next_url = href
-                        break
+            post_id = node.get("id") or ""
+            url_post_id = ""
+            if url:
+                if "/posts/" in url:
+                    url_post_id = url.split("/posts/")[-1].split("?")[0].strip("/")
+                elif "fbid=" in url:
+                    parsed = urlparse.urlparse(url)
+                    queries = urlparse.parse_qs(parsed.query)
+                    if "fbid" in queries:
+                        url_post_id = queries["fbid"][0]
+                elif "/photos/" in url:
+                    parts = url.split("/photos/")[-1].split("/")
+                    if len(parts) >= 2:
+                        url_post_id = parts[1]
                         
-                    # Fallback text check
-                    if any(k in text.lower() for k in ["show more", "lihat postingan lainnya", "lihat lainnya", "more posts", "postingan lainnya"]):
-                        if href.startswith('/'):
-                            next_url = f"https://mbasic.facebook.com{href}"
-                        else:
-                            next_url = href
+            dedup_key = url_post_id or post_id
+            if not dedup_key:
+                continue
+                
+            images = list(set([img for img in find_images(node) if img]))
+            
+            if not message_text and not images:
+                continue
+                
+            if dedup_key not in extracted_posts:
+                extracted_posts[dedup_key] = {
+                    "post_id": url_post_id or post_id,
+                    "content": message_text,
+                    "timestamp": creation_time,
+                    "story_link": url if url.startswith("http") else f"https://www.facebook.com{url}" if url else "",
+                    "images": images,
+                    "scraped_at": datetime.now().isoformat()
+                }
+            else:
+                existing = extracted_posts[dedup_key]
+                if not existing["content"] and message_text:
+                    existing["content"] = message_text
+                if not existing["timestamp"] and creation_time:
+                    existing["timestamp"] = creation_time
+                if not existing["story_link"] and url:
+                    existing["story_link"] = url if url.startswith("http") else f"https://www.facebook.com{url}" if url else ""
+                if len(images) > len(existing["images"]):
+                    existing["images"] = images
+
+        # Deduplicate further by content to collapse duplicates
+        final_posts = []
+        seen_contents = set()
+        
+        sorted_keys = sorted(
+            extracted_posts.keys(),
+            key=lambda k: (
+                1 if extracted_posts[k]["story_link"] else 0,
+                1 if extracted_posts[k]["timestamp"] else 0,
+                0 if "Uzpf" in k else 1
+            ),
+            reverse=True
+        )
+        
+        for k in sorted_keys:
+            p = extracted_posts[k]
+            content_slug = p["content"].strip()
+            content_slug = re.sub(r'\s+', ' ', content_slug)
+            
+            if content_slug and content_slug in seen_contents:
+                for fp in final_posts:
+                    fp_slug = re.sub(r'\s+', ' ', fp["content"].strip())
+                    if fp_slug == content_slug:
+                        if not fp["timestamp"] and p["timestamp"]:
+                            fp["timestamp"] = p["timestamp"]
+                        if not fp["story_link"] and p["story_link"]:
+                            fp["story_link"] = p["story_link"]
+                        if len(p["images"]) > len(fp["images"]):
+                            fp["images"] = p["images"]
                         break
+                continue
+                
+            if content_slug:
+                seen_contents.add(content_slug)
+            final_posts.append(p)
 
-                if not next_url or new_posts_found == 0:
-                    break
+        # Slice to requested limit
+        final_posts = final_posts[:limit]
 
-                current_url = next_url
-                page_num += 1
-                time.sleep(delay)
+        # Convert timestamps for presentation
+        for p in final_posts:
+            ts = p["timestamp"]
+            if ts:
+                try:
+                    p["timestamp"] = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    p["timestamp"] = str(ts)
+            else:
+                p["timestamp"] = "Unknown"
+
+        posts = final_posts
 
         # Output results
         if not posts:

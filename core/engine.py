@@ -1,11 +1,11 @@
-import requests
-from scrapling import Selector
 import urllib.parse
+from scrapling import Selector
+from scrapling.fetchers import StealthyFetcher
 
 class ScrapingEngine:
     """
     Wrapper for Scrapling to ensure headers, cookies, and settings
-    are applied consistently across all scraping activities using requests session
+    are applied consistently across all scraping activities using StealthyFetcher
     and wrapped Scrapling Selector.
     """
     def __init__(self, config: dict):
@@ -15,43 +15,48 @@ class ScrapingEngine:
         self.user_agent = self.settings.get("user_agent")
 
     def get_headers(self) -> dict:
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-        }
+        headers = {}
         if self.user_agent:
             headers["User-Agent"] = self.user_agent
         return headers
 
-    def get_cookies(self) -> dict:
-        # Automatically URL-decode cookie values when preparing requests
-        return {k: urllib.parse.unquote(v) for k, v in self.cookies.items()}
+    def get_cookies(self) -> list:
+        # Format cookies in Playwright's format
+        playwright_cookies = []
+        for k, v in self.cookies.items():
+            playwright_cookies.append({
+                "name": k,
+                "value": urllib.parse.unquote(v),
+                "domain": ".facebook.com",
+                "path": "/"
+            })
+        return playwright_cookies
 
     def get_delay(self) -> float:
         return float(self.settings.get("request_delay_seconds", 2.0))
 
-    def fetch_page(self, url: str):
+    def fetch_page(self, url: str, page_action=None):
         """
-        Fetch a page using requests and wrap it in a Scrapling Selector.
+        Fetch a page using Scrapling's StealthyFetcher and return a Selector.
         """
-        headers = self.get_headers()
         cookies = self.get_cookies()
-
-        session = requests.Session()
-        session.headers.update(headers)
         
-        response = session.get(url, cookies=cookies)
+        # Use StealthyFetcher.fetch
+        response = StealthyFetcher.fetch(
+            url,
+            cookies=cookies,
+            headless=True,
+            network_idle=True,
+            page_action=page_action
+        )
         
-        # Wrap response in Scrapling Selector
-        # Use response.content (bytes) to avoid lxml encoding declaration errors
-        selector = Selector(response.content)
+        # Wrap HTML content in Scrapling Selector
+        selector = Selector(response.html_content)
         
-        # Attach url and status for compatibility with scraper logic
+        # Attach details for scraper compatibility
         selector.url = response.url
-        selector.status = response.status_code
+        selector.status = response.status
+        # Attach raw response object so scraper can access details if needed
+        selector.response = response
+        
         return selector

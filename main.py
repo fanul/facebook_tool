@@ -1,6 +1,13 @@
 import os
 import json
+import sys
 from rich.console import Console
+
+# Reconfigure stdout to UTF-8 to prevent encoding errors on Windows
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 from rich.panel import Panel
 from rich.align import Align
 import questionary
