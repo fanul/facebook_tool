@@ -6,6 +6,18 @@ import re
 import random
 import math
 import sys
+# Reconfigure stdout to UTF-8 to prevent encoding errors on Windows
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
+# Add project root directory to sys.path if run directly
+import os
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import urllib.parse as urlparse
 from datetime import datetime
 from rich.console import Console
@@ -16,6 +28,7 @@ import questionary
 
 from core.base_tool import BaseTool
 from core.engine import ScrapingEngine
+
 
 console = Console()
 
@@ -673,3 +686,9 @@ class FacebookPostScraper(BaseTool):
             table.add_row(post["post_id"], post["timestamp"], preview)
             
         console.print(table)
+
+if __name__ == "__main__":
+    console.print("\n[bold yellow]⚠ Warning: This is a plugin module for the modular web scraper suite.[/bold yellow]")
+    console.print("To run the scraper tool, please execute the main entry point from the root folder instead:")
+    console.print("  [bold green]python main.py[/bold green]\n")
+
