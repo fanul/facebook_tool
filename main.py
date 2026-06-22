@@ -57,7 +57,7 @@ def manage_auth(config: dict):
         "What would you like to do?",
         choices=[
             "Test current session connection",
-            "Set new session cookies (Raw string)",
+            "Set new session cookies (Raw string or JSON)",
             "Clear current session cookies",
             "Back to main menu"
         ]
@@ -74,10 +74,10 @@ def manage_auth(config: dict):
         else:
             console.print(f"[bold red]❌ Failed: {msg}[/bold red]")
             
-    elif action == "Set new session cookies (Raw string)":
-        console.print("[blue]Please paste your Facebook raw cookie string from browser devtools:[/blue]")
-        console.print("[dim]Tip: In Chrome/Firefox, open devtools (F12) -> Network -> Select any mbasic.facebook.com request -> Copy value of 'Cookie' header.[/dim]")
-        raw_cookie = questionary.text("Cookie string:").ask()
+    elif action == "Set new session cookies (Raw string or JSON)":
+        console.print("[blue]Please paste your Facebook cookie string or JSON structure:[/blue]")
+        console.print("[dim]Tip: It supports JSON exports (e.g. EditThisCookie list structure) as well as raw key=value strings.[/dim]")
+        raw_cookie = questionary.text("Cookie string or JSON:").ask()
         if raw_cookie:
             parsed = parse_cookie_string(raw_cookie)
             if parsed and ("c_user" in parsed or "xs" in parsed):

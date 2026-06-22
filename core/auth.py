@@ -3,12 +3,39 @@ import re
 from scrapling import Fetcher
 
 def parse_cookie_string(cookie_str: str) -> dict:
-    """Parse a raw cookie string (e.g. key1=val1; key2=val2) into a dictionary."""
+    """
+    Parse cookie input. It intelligently handles:
+    1. JSON List of cookie dicts (e.g. from browser extension exports like EditThisCookie).
+    2. JSON Object/Dict of key-value pairs.
+    3. Raw cookie strings (e.g. key1=val1; key2=val2).
+    """
     cookies = {}
     if not cookie_str:
         return cookies
+
+    cookie_str = cookie_str.strip()
+
+    # Try parsing as JSON first
+    if cookie_str.startswith('[') or cookie_str.startswith('{'):
+        try:
+            parsed_json = json.loads(cookie_str)
+            if isinstance(parsed_json, list):
+                # Standard array of cookie dicts: [{"name": "c_user", "value": "1280232621"}, ...]
+                for item in parsed_json:
+                    if isinstance(item, dict) and "name" in item and "value" in item:
+                        cookies[item["name"]] = str(item["value"])
+            elif isinstance(parsed_json, dict):
+                # Simple key-value dictionary: {"c_user": "1280232621", ...}
+                for k, v in parsed_json.items():
+                    cookies[k] = str(v)
+            if cookies:
+                return cookies
+        except Exception:
+            pass  # Fallback to parsing as raw string if JSON parsing fails
+
+    # Fallback to parsing as raw key=value string
     # Remove leading/trailing whitespaces and split by semicolon
-    pairs = cookie_str.strip().split(';')
+    pairs = cookie_str.split(';')
     for pair in pairs:
         if '=' in pair:
             key, val = pair.split('=', 1)

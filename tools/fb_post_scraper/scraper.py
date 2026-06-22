@@ -35,13 +35,49 @@ class FacebookPostScraper(BaseTool):
             return
 
         # Prompt for target
-        target = questionary.text(
-            "Enter Facebook Username or Profile ID (e.g., zuck, billgates, or 4):",
+        target_input = questionary.text(
+            "Enter Facebook Username, Profile ID, or Profile URL:",
             validate=lambda val: True if len(val.strip()) > 0 else "Target cannot be empty."
         ).ask()
         
-        if not target:
+        if not target_input:
             return
+
+        target_input = target_input.strip()
+        target = target_input
+
+        # Parse target from URL if user entered a full URL
+        if "facebook.com" in target_input:
+            # Handle URLs like:
+            # https://www.facebook.com/profile.php?id=10008323621
+            # https://mbasic.facebook.com/zuck
+            # https://facebook.com/groups/name/
+            # https://www.facebook.com/people/Some-Name/10008323621/
+            if "profile.php" in target_input:
+                # Extract id query param
+                import urllib.parse as urlparse
+                parsed_url = urlparse.urlparse(target_input)
+                queries = urlparse.parse_qs(parsed_url.query)
+                if "id" in queries:
+                    target = queries["id"][0]
+            else:
+                # Remove protocol, www., mbasic., etc.
+                clean_path = target_input
+                for prefix in ["https://", "http://", "www.", "mbasic.", "m.", "web."]:
+                    if prefix in clean_path:
+                        clean_path = clean_path.split(prefix, 1)[-1]
+                # Now it should look like facebook.com/zuck or facebook.com/profile/name/1234
+                parts = clean_path.split("facebook.com/", 1)[-1].strip("/").split("/")
+                
+                # Check for /people/Name/ID style
+                if len(parts) >= 3 and parts[0] == "people":
+                    target = parts[2]
+                elif len(parts) >= 1:
+                    # Take the first folder level as target username (e.g. zuck)
+                    target = parts[0]
+                    # Clean query parameters if any (e.g. zuck?refid=...)
+                    if "?" in target:
+                        target = target.split("?", 1)[0]
 
         # Prompt for limit
         limit_str = questionary.text("Enter max number of posts to scrape:", default="10").ask()
