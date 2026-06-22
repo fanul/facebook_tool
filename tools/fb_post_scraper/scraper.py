@@ -177,6 +177,30 @@ class FacebookPostScraper(BaseTool):
         engine = ScrapingEngine(config)
         graphql_data = []
 
+        # Setup export directory and file paths
+        export_dir = config.get("settings", {}).get("default_export_dir", "exports")
+        os.makedirs(export_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename_base = os.path.join(export_dir, f"fb_{target}_{timestamp}")
+        
+        json_file = f"{filename_base}.json"
+        csv_file = f"{filename_base}.csv"
+        
+        # Initialize output files on disk immediately
+        if export_format in ["CSV", "Both"]:
+            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Post ID", "Timestamp", "Content", "Story Link", "File Attached"])
+                
+        if export_format in ["JSON", "Both"]:
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump([], f)
+
+        scraped_posts = []
+        written_post_ids = set()
+        seen_contents = set()
+
         # Define all helper functions for parsing first, so scroll_action and later parsing can use them.
         def search_for_stories(data):
             stories = []
@@ -252,7 +276,7 @@ class FacebookPostScraper(BaseTool):
                         return res
             return ""
 
-        def count_captured_posts(html, g_data):
+        def export_new_posts(html, g_data):
             json_blobs = []
             if html:
                 all_script_blocks = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html)
@@ -269,6 +293,9 @@ class FacebookPostScraper(BaseTool):
                         json_blobs.append(json.loads(line))
                     except Exception:
                         pass
+            
+            # Clear raw string packets from memory immediately to save RAM
+            g_data.clear()
             
             all_story_nodes = []
             for blob in json_blobs:
@@ -293,13 +320,15 @@ class FacebookPostScraper(BaseTool):
                     if isinstance(msg_obj, dict):
                         message_text = msg_obj.get("text") or ""
                 
-                images = find_images(node)
+                images = list(set([img for img in find_images(node) if img]))
                 if not message_text and not images:
                     continue
                     
                 url = ""
                 if comet_sections:
                     url = find_field_value(comet_sections, "url")
+                    if url and not any(p in url for p in ["posts", "permalink", "photo", "story"]):
+                        url = ""
                 if not url:
                     url = find_valid_url(node)
 
@@ -321,8 +350,86 @@ class FacebookPostScraper(BaseTool):
                 dedup_key = url_post_id or post_id
                 if not dedup_key:
                     continue
-                extracted_posts[dedup_key] = True
-            return len(extracted_posts)
+                
+                if dedup_key not in extracted_posts:
+                    extracted_posts[dedup_key] = {
+                        "post_id": url_post_id or post_id,
+                        "content": message_text,
+                        "timestamp": find_field_value(comet_sections, "creation_time") or find_field_value(node, "creation_time"),
+                        "story_link": url if url.startswith("http") else f"https://www.facebook.com{url}" if url else "",
+                        "images": images,
+                        "scraped_at": datetime.now().isoformat()
+                    }
+                else:
+                    existing = extracted_posts[dedup_key]
+                    if not existing["content"] and message_text:
+                        existing["content"] = message_text
+                    if not existing["timestamp"]:
+                        existing["timestamp"] = find_field_value(comet_sections, "creation_time") or find_field_value(node, "creation_time")
+                    if not existing["story_link"] and url:
+                        existing["story_link"] = url if url.startswith("http") else f"https://www.facebook.com{url}" if url else ""
+                    if len(images) > len(existing["images"]):
+                        existing["images"] = images
+
+            new_count = 0
+            sorted_keys = sorted(
+                extracted_posts.keys(),
+                key=lambda k: (
+                    1 if extracted_posts[k]["story_link"] else 0,
+                    1 if extracted_posts[k]["timestamp"] else 0,
+                    0 if "Uzpf" in k else 1
+                ),
+                reverse=True
+            )
+            
+            for k in sorted_keys:
+                p = extracted_posts[k]
+                content_slug = p["content"].strip()
+                content_slug = re.sub(r'\s+', ' ', content_slug)
+                
+                is_duplicate = False
+                if p["post_id"] in written_post_ids:
+                    is_duplicate = True
+                elif content_slug and content_slug in seen_contents:
+                    is_duplicate = True
+                    
+                if not is_duplicate:
+                    if not scrape_all and len(scraped_posts) >= slice_limit:
+                        break
+                        
+                    written_post_ids.add(p["post_id"])
+                    if content_slug:
+                        seen_contents.add(content_slug)
+                    
+                    ts = p["timestamp"]
+                    if ts:
+                        try:
+                            p["timestamp"] = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
+                        except Exception:
+                            p["timestamp"] = str(ts)
+                    else:
+                        p["timestamp"] = "Unknown"
+                        
+                    scraped_posts.append(p)
+                    new_count += 1
+                    
+                    if export_format in ["CSV", "Both"]:
+                        with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+                            writer = csv.writer(f)
+                            writer.writerow([
+                                p["post_id"],
+                                p["timestamp"],
+                                p["content"],
+                                p["story_link"],
+                                ", ".join(p["images"])
+                            ])
+                            
+                    if export_format in ["JSON", "Both"]:
+                        with open(json_file, 'w', encoding='utf-8') as f:
+                            json.dump(scraped_posts, f, indent=2, ensure_ascii=False)
+            
+            if new_count > 0:
+                console.print(f"[green]✓ Exported {new_count} new posts to disk. (Total: {len(scraped_posts)})[/green]")
 
         # Initialize progress and task as None to avoid linter unbound warning
         progress = None
@@ -410,9 +517,11 @@ class FacebookPostScraper(BaseTool):
                 # Update position tracker
                 last_height = new_height
                 
-                # Show Position Reminder
+                # Export posts found in this scroll iteration to disk and clear RAM
                 current_html = page.content()
-                current_count = count_captured_posts(current_html, graphql_data)
+                export_new_posts(current_html, graphql_data)
+                
+                current_count = len(scraped_posts)
                 console.print(f"[magenta]ℹ Position Reminder: Height = {new_height}px | Collected Packets = {len(graphql_data)} | Approx. Unique Posts = {current_count}/{display_limit}[/magenta]")
                 
                 # If we have reached or exceeded the required limit, we can stop early!
@@ -432,18 +541,24 @@ class FacebookPostScraper(BaseTool):
                     if max_scroll_wait > 0:
                         delay = random.randint(0, max_scroll_wait)
                         if delay > 0:
-                            console.print(f"[yellow]⏱ Anti-bot pause: Next scroll queued in {delay} seconds (randomized 0-{max_scroll_wait}s)...[/yellow]")
+                            console.print(f"[yellow]⏱ Anti-bot pause: Waiting {delay} seconds before next scroll (randomized 0-{max_scroll_wait}s)...[/yellow]")
                             console.print(f"[dim]Next randomized pause scheduled after {scrolls_to_next_wait} more scrolls (Scroll #{next_wait_scroll})[/dim]")
                             
                             # Countdown display showing elapsed and remaining seconds
                             for elapsed in range(1, delay + 1):
                                 remaining = delay - elapsed
+                                # Print countdown to terminal so user sees live timer
+                                console.print(
+                                    f"[yellow]   ⏳ {elapsed:>3}s elapsed | {remaining:>3}s remaining[/yellow]",
+                                    end="\r"
+                                )
                                 if progress and task:
                                     progress.update(
                                         task, 
                                         description=f"[yellow]⏱ Waiting: {elapsed}s elapsed | {remaining}s remaining (total {delay}s)...[/yellow]"
                                     )
                                 time.sleep(1)
+                            console.print()  # newline after countdown
                             
                             if progress and task:
                                 progress.update(task, description="[green]✓ Pause finished. Resuming...[/green]")
@@ -481,159 +596,11 @@ class FacebookPostScraper(BaseTool):
             return
 
         # Parse captured json data
-        console.print("[cyan]Parsing preloaded JSON blocks and GraphQL data...[/cyan]")
-        initial_html = selector.html_content if hasattr(selector, "html_content") else ""
-        all_script_blocks = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', initial_html)
-        
-        json_blobs = []
-        for sb in all_script_blocks:
-            try:
-                json_blobs.append(json.loads(sb))
-            except Exception:
-                pass
-                
-        for g_text in graphql_data:
-            for line in g_text.strip().split("\n"):
-                if not line.strip():
-                    continue
-                try:
-                    json_blobs.append(json.loads(line))
-                except Exception:
-                    pass
+        console.print("[cyan]Performing final disk export and memory cleanup...[/cyan]")
+        final_html = selector.html_content if hasattr(selector, "html_content") else ""
+        export_new_posts(final_html, graphql_data)
 
-        all_story_nodes = []
-        for blob in json_blobs:
-            all_story_nodes.extend(search_for_stories(blob))
-
-        extracted_posts = {}
-
-        for node in all_story_nodes:
-            comet_sections = node.get("comet_sections", {})
-            if not comet_sections and isinstance(node, dict):
-                story = node.get("story")
-                if isinstance(story, dict):
-                    node = story
-                    comet_sections = node.get("comet_sections", {})
-            
-            message_text = ""
-            if comet_sections:
-                msg_obj = find_field_value(comet_sections, "message")
-                if isinstance(msg_obj, dict):
-                    message_text = msg_obj.get("text") or ""
-            if not message_text:
-                msg_obj = find_field_value(node, "message")
-                if isinstance(msg_obj, dict):
-                    message_text = msg_obj.get("text") or ""
-            
-            creation_time = None
-            if comet_sections:
-                creation_time = find_field_value(comet_sections, "creation_time")
-            if creation_time is None:
-                creation_time = find_field_value(node, "creation_time")
-                
-            url = ""
-            if comet_sections:
-                url = find_field_value(comet_sections, "url")
-                if url and not any(p in url for p in ["posts", "permalink", "photo", "story"]):
-                    url = ""
-            if not url:
-                url = find_valid_url(node)
-
-            post_id = node.get("id") or ""
-            url_post_id = ""
-            if url:
-                if "/posts/" in url:
-                    url_post_id = url.split("/posts/")[-1].split("?")[0].strip("/")
-                elif "fbid=" in url:
-                    parsed = urlparse.urlparse(url)
-                    queries = urlparse.parse_qs(parsed.query)
-                    if "fbid" in queries:
-                        url_post_id = queries["fbid"][0]
-                elif "/photos/" in url:
-                    parts = url.split("/photos/")[-1].split("/")
-                    if len(parts) >= 2:
-                        url_post_id = parts[1]
-                        
-            dedup_key = url_post_id or post_id
-            if not dedup_key:
-                continue
-                
-            images = list(set([img for img in find_images(node) if img]))
-            
-            if not message_text and not images:
-                continue
-                
-            if dedup_key not in extracted_posts:
-                extracted_posts[dedup_key] = {
-                    "post_id": url_post_id or post_id,
-                    "content": message_text,
-                    "timestamp": creation_time,
-                    "story_link": url if url.startswith("http") else f"https://www.facebook.com{url}" if url else "",
-                    "images": images,
-                    "scraped_at": datetime.now().isoformat()
-                }
-            else:
-                existing = extracted_posts[dedup_key]
-                if not existing["content"] and message_text:
-                    existing["content"] = message_text
-                if not existing["timestamp"] and creation_time:
-                    existing["timestamp"] = creation_time
-                if not existing["story_link"] and url:
-                    existing["story_link"] = url if url.startswith("http") else f"https://www.facebook.com{url}" if url else ""
-                if len(images) > len(existing["images"]):
-                    existing["images"] = images
-
-        # Deduplicate further by content to collapse duplicates
-        final_posts = []
-        seen_contents = set()
-        
-        sorted_keys = sorted(
-            extracted_posts.keys(),
-            key=lambda k: (
-                1 if extracted_posts[k]["story_link"] else 0,
-                1 if extracted_posts[k]["timestamp"] else 0,
-                0 if "Uzpf" in k else 1
-            ),
-            reverse=True
-        )
-        
-        for k in sorted_keys:
-            p = extracted_posts[k]
-            content_slug = p["content"].strip()
-            content_slug = re.sub(r'\s+', ' ', content_slug)
-            
-            if content_slug and content_slug in seen_contents:
-                for fp in final_posts:
-                    fp_slug = re.sub(r'\s+', ' ', fp["content"].strip())
-                    if fp_slug == content_slug:
-                        if not fp["timestamp"] and p["timestamp"]:
-                            fp["timestamp"] = p["timestamp"]
-                        if not fp["story_link"] and p["story_link"]:
-                            fp["story_link"] = p["story_link"]
-                        if len(p["images"]) > len(fp["images"]):
-                            fp["images"] = p["images"]
-                        break
-                continue
-                
-            if content_slug:
-                seen_contents.add(content_slug)
-            final_posts.append(p)
-
-        # Slice to requested limit
-        final_posts = final_posts[:slice_limit]
-
-        # Convert timestamps for presentation
-        for p in final_posts:
-            ts = p["timestamp"]
-            if ts:
-                try:
-                    p["timestamp"] = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    p["timestamp"] = str(ts)
-            else:
-                p["timestamp"] = "Unknown"
-
-        posts = final_posts
+        posts = scraped_posts
 
         # Output results
         if not posts:
@@ -645,34 +612,10 @@ class FacebookPostScraper(BaseTool):
 
         console.print(f"\n[green]Scraped [bold]{len(posts)}[/bold] posts successfully![/green]")
         
-        # Save to file
-        export_dir = config.get("settings", {}).get("default_export_dir", "exports")
-        os.makedirs(export_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename_base = os.path.join(export_dir, f"fb_{target}_{timestamp}")
-        
-        # Create full output path links for reporting
-        json_file = f"{filename_base}.json"
-        csv_file = f"{filename_base}.csv"
-        
         if export_format in ["JSON", "Both"]:
-            with open(json_file, 'w', encoding='utf-8') as f:
-                json.dump(posts, f, indent=2, ensure_ascii=False)
             console.print(f"Saved JSON export: [bold underline]{os.path.abspath(json_file)}[/bold underline]")
             
         if export_format in ["CSV", "Both"]:
-            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Post ID", "Timestamp", "Content", "Story Link", "File Attached"])
-                for post in posts:
-                    writer.writerow([
-                        post["post_id"],
-                        post["timestamp"],
-                        post["content"],
-                        post["story_link"],
-                        ", ".join(post["images"])
-                    ])
             console.print(f"Saved CSV export: [bold underline]{os.path.abspath(csv_file)}[/bold underline]")
 
         # Print preview table
