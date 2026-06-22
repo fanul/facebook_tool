@@ -8,38 +8,57 @@ def parse_cookie_string(cookie_str: str) -> dict:
     1. JSON List of cookie dicts (e.g. from browser extension exports like EditThisCookie).
     2. JSON Object/Dict of key-value pairs.
     3. Raw cookie strings (e.g. key1=val1; key2=val2).
+    It also sanitizes newlines and spaces introduced by terminal copy-paste actions.
     """
     cookies = {}
     if not cookie_str:
         return cookies
 
-    cookie_str = cookie_str.strip()
+    # Strip whitespace and Unicode BOM if present (common in Notepad files)
+    cookie_str = cookie_str.strip().lstrip('\ufeff')
 
-    # Try parsing as JSON first
-    if cookie_str.startswith('[') or cookie_str.startswith('{'):
-        try:
-            parsed_json = json.loads(cookie_str)
-            if isinstance(parsed_json, list):
-                # Standard array of cookie dicts: [{"name": "c_user", "value": "1280232621"}, ...]
-                for item in parsed_json:
-                    if isinstance(item, dict) and "name" in item and "value" in item:
-                        cookies[item["name"]] = str(item["value"])
-            elif isinstance(parsed_json, dict):
-                # Simple key-value dictionary: {"c_user": "1280232621", ...}
-                for k, v in parsed_json.items():
-                    cookies[k] = str(v)
-            if cookies:
-                return cookies
-        except Exception:
-            pass  # Fallback to parsing as raw string if JSON parsing fails
+    def extract_from_json(parsed_json) -> dict:
+        result = {}
+        if isinstance(parsed_json, list):
+            for item in parsed_json:
+                if isinstance(item, dict) and "name" in item and "value" in item:
+                    result[item["name"]] = str(item["value"])
+        elif isinstance(parsed_json, dict):
+            for k, v in parsed_json.items():
+                result[k] = str(v)
+        return result
 
-    # Fallback to parsing as raw key=value string
-    # Remove leading/trailing whitespaces and split by semicolon
-    pairs = cookie_str.split(';')
+    # 1. Try parsing as standard JSON
+    try:
+        parsed_json = json.loads(cookie_str)
+        extracted = extract_from_json(parsed_json)
+        if extracted:
+            return extracted
+    except Exception:
+        pass
+
+    # 2. Try parsing as JSON after stripping all whitespace/newlines (fixes console wrapping/copy-paste breaks)
+    try:
+        cleaned_json_str = re.sub(r'\s+', '', cookie_str)
+        parsed_json = json.loads(cleaned_json_str)
+        extracted = extract_from_json(parsed_json)
+        if extracted:
+            return extracted
+    except Exception:
+        pass
+
+    # 3. Fallback to parsing as raw key=value string
+    # Remove all formatting newlines and carriage returns
+    cleaned_raw = cookie_str.replace('\r', '').replace('\n', '')
+    pairs = cleaned_raw.split(';')
     for pair in pairs:
         if '=' in pair:
             key, val = pair.split('=', 1)
-            cookies[key.strip()] = val.strip()
+            # Remove any internal spaces introduced by word-wrapping
+            clean_key = key.replace(' ', '').strip()
+            clean_val = val.replace(' ', '').strip()
+            if clean_key:
+                cookies[clean_key] = clean_val
     return cookies
 
 def check_facebook_login(cookies: dict, user_agent: str = None) -> tuple[bool, str]:
