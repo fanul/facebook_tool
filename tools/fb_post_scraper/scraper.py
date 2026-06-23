@@ -28,6 +28,7 @@ import questionary
 
 from core.base_tool import BaseTool
 from core.engine import ScrapingEngine
+from core.auth import check_facebook_login
 
 
 console = Console()
@@ -430,21 +431,53 @@ class FacebookPostScraper(BaseTool):
             
             if new_count > 0:
                 console.print(f"[green]✓ Exported {new_count} new posts to disk. (Total: {len(scraped_posts)})[/green]")
+            return new_count
+
+        # ── Health monitoring thresholds ─────────────────────────────────────
+        # Consecutive scrolls with 0 new posts before escalating warning
+        STALL_WARN_THRESHOLD    = 5
+        # Consecutive scrolls with 0 new posts before triggering session check
+        STALL_CHECK_THRESHOLD   = 10
+        # Consecutive scrolls with 0 new posts before auto-stopping
+        STALL_AUTOSTOP_THRESHOLD = 20
+        # How often (scrolls) to do a periodic session ping even if not stalled
+        SESSION_PING_EVERY      = 50
 
         # Initialize progress and task as None to avoid linter unbound warning
         progress = None
         task = None
 
+        def do_session_check() -> tuple[bool, str]:
+            """Lightweight session health check via mbasic (runs in background thread-safe via requests)."""
+            try:
+                ua = settings.get("user_agent")
+                ok, msg = check_facebook_login(cookies, ua)
+                return ok, msg
+            except Exception as e:
+                return False, str(e)
+
         def scroll_action(page):
+            nonlocal cookies  # needed for session re-check
+
+            # ── Stall / health tracking state ─────────────────────────────
+            consecutive_stall   = 0   # scrolls in a row with 0 new posts
+            consecutive_no_pkt  = 0   # scrolls in a row with 0 new packets
+            last_new_post_at    = 0   # scroll number when last post was found
+            session_ok          = True
+            last_session_check  = 0   # scroll number of last session check
+            last_session_msg    = "Not checked yet"
+            packets_this_scroll = 0
+
             # Intercept response
             def on_response(response):
+                nonlocal packets_this_scroll
                 if "graphql" in response.url:
                     try:
                         text = response.text()
                         if "timeline_list_feed_units" in text or "feedUnit" in text or "comet_sections" in text:
                             graphql_data.append(text)
-                            # Print detailed CLI output when fetching data
-                            console.print(f"[bold green]✓[/bold green] [cyan]Captured GraphQL packet ({len(text)} bytes) from Facebook.[/cyan]")
+                            packets_this_scroll += 1
+                            console.print(f"[bold green]✓[/bold green] [cyan]Captured GraphQL packet ({len(text):,} bytes)[/cyan]")
                     except Exception:
                         pass
             page.on("response", on_response)
@@ -478,100 +511,165 @@ class FacebookPostScraper(BaseTool):
 
             while scroll_count < target_scrolls:
                 scroll_count += 1
+                packets_this_scroll = 0   # reset per-scroll packet counter
+
                 console.print(f"[bold blue]>>> Scroll #{scroll_count} of ~{target_scrolls if not scrape_all else 'Unlimited'}[/bold blue]")
-                console.print(f"[cyan]Scrolling to bottom... (Current Height: {last_height}px)[/cyan]")
+                console.print(f"[cyan]  ↓ Scrolling to bottom... (Height: {last_height:,}px)[/cyan]")
                 if progress and task:
-                    progress.update(task, description=f"[cyan]Scrolling #{scroll_count} (Height: {last_height}px)...[/cyan]")
+                    progress.update(task, description=f"[cyan]Scrolling #{scroll_count} | Posts: {len(scraped_posts)} | Stall: {consecutive_stall}[/cyan]")
                 
                 # Perform scroll
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 
-                # Wait 4 seconds for content/height update to start and fetch any lazy-loaded content
+                # Wait for content/height update
                 if progress and task:
-                    progress.update(task, description=f"[cyan]Fetching content/waiting for network (Scroll #{scroll_count})...[/cyan]")
+                    progress.update(task, description=f"[cyan]Fetching network response (Scroll #{scroll_count})...[/cyan]")
                 page.wait_for_timeout(4000)
                 
                 new_height = page.evaluate("document.body.scrollHeight")
                 
-                # Verify if height actually increased
+                # Height-unchanged nudge
                 if new_height == last_height:
-                    # Let's perform a scroll nudge: scroll up slightly and then down again, wait to be sure
-                    console.print(f"[yellow]⚠ Height unchanged ({new_height}px). Nudging scroll to trigger lazy load...[/yellow]")
+                    console.print(f"[yellow]  ⚠ Height unchanged ({new_height:,}px). Nudging scroll...[/yellow]")
                     if progress and task:
                         progress.update(task, description="[yellow]Nudging scroll to trigger lazy load...[/yellow]")
-                    
                     page.evaluate("window.scrollBy(0, -600)")
                     page.wait_for_timeout(1500)
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     page.wait_for_timeout(4000)
-                    
                     new_height = page.evaluate("document.body.scrollHeight")
                 
-                console.print(f"[dim]Page height position: {last_height}px -> {new_height}px[/dim]")
+                console.print(f"[dim]  Height: {last_height:,}px → {new_height:,}px | Packets this scroll: {packets_this_scroll}[/dim]")
                 
-                # If height did not increase even after nudge, stop automatically
+                # Auto-stop: page height didn't grow at all
                 if new_height == last_height:
-                    console.print("[bold green]Reached the end of the feed (bottom of page). Stopping scroll.[/bold green]")
+                    console.print("[bold green]  ✓ Reached the end of the feed. Stopping.[/bold green]")
                     break
                 
-                # Update position tracker
                 last_height = new_height
                 
-                # Export posts found in this scroll iteration to disk and clear RAM
+                # ── Export posts & track stall status ───────────────────────
                 current_html = page.content()
-                export_new_posts(current_html, graphql_data)
-                
+                new_found = export_new_posts(current_html, graphql_data)
                 current_count = len(scraped_posts)
-                console.print(f"[magenta]ℹ Position Reminder: Height = {new_height}px | Collected Packets = {len(graphql_data)} | Approx. Unique Posts = {current_count}/{display_limit}[/magenta]")
-                
-                # If we have reached or exceeded the required limit, we can stop early!
+
+                if new_found > 0:
+                    consecutive_stall  = 0
+                    consecutive_no_pkt = 0
+                    last_new_post_at   = scroll_count
+                else:
+                    consecutive_stall += 1
+                    if packets_this_scroll == 0:
+                        consecutive_no_pkt += 1
+                    else:
+                        consecutive_no_pkt = 0  # got packets but no new deduped posts — normal
+
+                # ── Periodic session ping (every N scrolls, even if healthy) ─
+                if scroll_count - last_session_check >= SESSION_PING_EVERY:
+                    console.print(f"[dim]  🔄 Periodic session check (every {SESSION_PING_EVERY} scrolls)...[/dim]")
+                    session_ok, last_session_msg = do_session_check()
+                    last_session_check = scroll_count
+                    if session_ok:
+                        console.print(f"[dim]  ✅ Session OK: {last_session_msg}[/dim]")
+                    else:
+                        console.print(f"[bold red]  ❌ Session INVALID: {last_session_msg}[/bold red]")
+
+                # ── Status dashboard line ────────────────────────────────────
+                stall_color  = "green" if consecutive_stall == 0 else ("yellow" if consecutive_stall < STALL_CHECK_THRESHOLD else "red")
+                session_icon = "✅" if session_ok else "❌"
+                since_last   = (f"Scroll #{last_new_post_at}" if last_new_post_at else "none yet")
+                console.print(
+                    f"[magenta]  📊 Posts: {current_count}/{display_limit} "
+                    f"| Height: {new_height:,}px "
+                    f"| Pkts: {packets_this_scroll} "
+                    f"| [{stall_color}]Stall: {consecutive_stall}[/{stall_color}] "
+                    f"| Last new: {since_last} "
+                    f"| Session: {session_icon}[/magenta]"
+                )
+
+                # ── Stall escalation logic ───────────────────────────────────
+                if consecutive_stall >= STALL_WARN_THRESHOLD and consecutive_stall < STALL_CHECK_THRESHOLD:
+                    console.print(
+                        f"[yellow]  ⚠ STALL WARNING: No new posts for {consecutive_stall} consecutive scrolls. "
+                        f"Last new post at Scroll #{last_new_post_at}.[/yellow]"
+                    )
+
+                elif consecutive_stall == STALL_CHECK_THRESHOLD:
+                    console.print(
+                        f"[bold yellow]  ⚠ STALL: {consecutive_stall} scrolls with no new posts. "
+                        f"Triggering session health check...[/bold yellow]"
+                    )
+                    session_ok, last_session_msg = do_session_check()
+                    last_session_check = scroll_count
+                    if session_ok:
+                        console.print(
+                            f"[green]  ✅ Session still valid: {last_session_msg}[/green]\n"
+                            f"[dim]  → Data may be exhausted or Facebook is throttling. Continuing...[/dim]"
+                        )
+                    else:
+                        console.print(
+                            f"[bold red]  ❌ SESSION EXPIRED: {last_session_msg}[/bold red]\n"
+                            f"[bold red]  → Stopping scraper. Please refresh your cookies and restart.[/bold red]"
+                        )
+                        break
+
+                elif consecutive_stall >= STALL_AUTOSTOP_THRESHOLD:
+                    # Do one final session check before stopping
+                    session_ok, last_session_msg = do_session_check()
+                    last_session_check = scroll_count
+                    status_str = f"Session: {'✅ valid' if session_ok else '❌ EXPIRED'} — {last_session_msg}"
+                    console.print(
+                        f"[bold red]  🛑 AUTO-STOP: {consecutive_stall} scrolls with zero new posts.\n"
+                        f"  {status_str}\n"
+                        f"  Last new post was at Scroll #{last_new_post_at}. "
+                        f"Likely reached the end of available posts or session is rate-limited.[/bold red]"
+                    )
+                    break
+
+                # ── Limit check ──────────────────────────────────────────────
                 if not scrape_all and current_count >= slice_limit:
-                    console.print(f"[bold green]✓ Target post limit ({slice_limit}) reached/exceeded ({current_count} posts). Stopping scroll.[/bold green]")
+                    console.print(f"[bold green]  ✓ Target limit ({slice_limit}) reached ({current_count} posts). Stopping.[/bold green]")
                     break
                 
                 if scroll_count >= target_scrolls:
                     break
                     
-                # Perform anti-bot pause if we hit our random scroll frequency target
+                # ── Anti-bot pause ───────────────────────────────────────────
                 if scroll_count == next_wait_scroll:
-                    # Determine next target scroll count first
                     scrolls_to_next_wait = random.randint(scroll_freq_min, scroll_freq_max)
                     next_wait_scroll = scroll_count + scrolls_to_next_wait
                     
                     if max_scroll_wait > 0:
                         delay = random.randint(0, max_scroll_wait)
                         if delay > 0:
-                            console.print(f"[yellow]⏱ Anti-bot pause: Waiting {delay} seconds before next scroll (randomized 0-{max_scroll_wait}s)...[/yellow]")
-                            console.print(f"[dim]Next randomized pause scheduled after {scrolls_to_next_wait} more scrolls (Scroll #{next_wait_scroll})[/dim]")
+                            console.print(f"[yellow]  ⏱ Anti-bot pause: {delay}s (randomized 0-{max_scroll_wait}s)[/yellow]")
+                            console.print(f"[dim]  Next pause after {scrolls_to_next_wait} scrolls (Scroll #{next_wait_scroll})[/dim]")
                             
-                            # Countdown display showing elapsed and remaining seconds
                             for elapsed in range(1, delay + 1):
                                 remaining = delay - elapsed
-                                # Print countdown to terminal so user sees live timer
                                 console.print(
                                     f"[yellow]   ⏳ {elapsed:>3}s elapsed | {remaining:>3}s remaining[/yellow]",
                                     end="\r"
                                 )
                                 if progress and task:
                                     progress.update(
-                                        task, 
-                                        description=f"[yellow]⏱ Waiting: {elapsed}s elapsed | {remaining}s remaining (total {delay}s)...[/yellow]"
+                                        task,
+                                        description=f"[yellow]⏱ Anti-bot pause: {elapsed}s/{delay}s | Posts: {len(scraped_posts)} | Stall: {consecutive_stall}[/yellow]"
                                     )
                                 time.sleep(1)
                             console.print()  # newline after countdown
                             
                             if progress and task:
                                 progress.update(task, description="[green]✓ Pause finished. Resuming...[/green]")
-                            console.print("[green]✓ Pause finished. Resuming scroll...[/green]\n")
+                            console.print("[green]  ✓ Pause done. Resuming scroll...[/green]\n")
                         else:
-                            console.print("[dim]⏱ Anti-bot pause selected 0 seconds delay. Resuming immediately...[/dim]")
-                            console.print(f"[dim]Next randomized pause scheduled after {scrolls_to_next_wait} more scrolls (Scroll #{next_wait_scroll})[/dim]\n")
+                            console.print("[dim]  ⏱ 0s delay selected. Resuming immediately.[/dim]")
+                            console.print(f"[dim]  Next pause after {scrolls_to_next_wait} scrolls (Scroll #{next_wait_scroll})[/dim]\n")
                     else:
-                        console.print("[dim]⏱ Anti-bot pauses disabled (max wait time is 0). Resuming immediately...[/dim]\n")
+                        console.print("[dim]  ⏱ Anti-bot pauses disabled.[/dim]\n")
                 else:
-                    # No wait on this scroll
                     scrolls_left = next_wait_scroll - scroll_count
-                    console.print(f"[dim]No pause this scroll. Next pause in {scrolls_left} scrolls (Scroll #{next_wait_scroll})[/dim]\n")
+                    console.print(f"[dim]  Next pause in {scrolls_left} scrolls (Scroll #{next_wait_scroll})[/dim]\n")
 
         posts = []
         console.print(f"\n[yellow]Starting headless browser session for target: [bold]{target}[/bold]...[/yellow]")
