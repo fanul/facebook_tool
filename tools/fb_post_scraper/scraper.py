@@ -55,7 +55,7 @@ class FacebookPostScraper(BaseTool):
 
         # Prompt for target
         target_input = questionary.text(
-            "Enter Facebook Username, Profile ID, or Profile URL:",
+            "Enter Facebook Username, Profile ID, Profile URL, or Group URL:",
             validate=lambda val: True if len(val.strip()) > 0 else "Target cannot be empty."
         ).ask()
         
@@ -64,16 +64,17 @@ class FacebookPostScraper(BaseTool):
 
         target_input = target_input.strip()
         target = target_input
+        target_type = "profile"   # 'profile' or 'group'
 
         # Parse target from URL if user entered a full URL
         if "facebook.com" in target_input:
             # Handle URLs like:
             # https://www.facebook.com/profile.php?id=10008323621
+            # https://www.facebook.com/groups/mygroup/
+            # https://www.facebook.com/groups/123456789/
             # https://mbasic.facebook.com/zuck
-            # https://facebook.com/groups/name/
             # https://www.facebook.com/people/Some-Name/10008323621/
             if "profile.php" in target_input:
-                # Extract id query param
                 parsed_url = urlparse.urlparse(target_input)
                 queries = urlparse.parse_qs(parsed_url.query)
                 if "id" in queries:
@@ -84,18 +85,30 @@ class FacebookPostScraper(BaseTool):
                 for prefix in ["https://", "http://", "www.", "mbasic.", "m.", "web."]:
                     if prefix in clean_path:
                         clean_path = clean_path.split(prefix, 1)[-1]
-                # Now it should look like facebook.com/zuck or facebook.com/profile/name/1234
+                # Now it should look like facebook.com/zuck or facebook.com/groups/name
                 parts = clean_path.split("facebook.com/", 1)[-1].strip("/").split("/")
-                
-                # Check for /people/Name/ID style
-                if len(parts) >= 3 and parts[0] == "people":
+
+                if len(parts) >= 2 and parts[0] == "groups":
+                    # Group URL: facebook.com/groups/{name_or_id}
+                    target_type = "group"
+                    target = parts[1].split("?")[0]   # strip any query params
+                elif len(parts) >= 3 and parts[0] == "people":
+                    # /people/Some-Name/12345 style
                     target = parts[2]
                 elif len(parts) >= 1:
-                    # Take the first folder level as target username (e.g. zuck)
+                    # Regular username: facebook.com/zuck
                     target = parts[0]
-                    # Clean query parameters if any (e.g. zuck?refid=...)
                     if "?" in target:
                         target = target.split("?", 1)[0]
+
+        # If user typed just "groups/mygroup" or "groups/123" without full URL
+        elif target_input.startswith("groups/"):
+            target_type = "group"
+            target = target_input.split("groups/", 1)[-1].strip("/").split("?")[0]
+
+        # Show confirmation of what was detected
+        type_label = "[bold cyan]Group[/bold cyan]" if target_type == "group" else "[bold cyan]Profile/Page[/bold cyan]"
+        console.print(f"[dim]  Detected target type: {type_label} → identifier: [bold]{target}[/bold][/dim]")
 
         # Prompt for limit (supports -1 or negative for all posts)
         limit_str = questionary.text("Enter max number of posts to scrape (use -1 or negative for all posts):", default="10").ask()
@@ -169,8 +182,11 @@ class FacebookPostScraper(BaseTool):
             choices=["JSON", "CSV", "Both"]
         ).ask()
 
-        # Build initial URL (Desktop version)
-        if target.isdigit():
+        # Build initial URL based on target type
+        if target_type == "group":
+            # Groups always use /groups/{name_or_id}
+            base_url = f"https://www.facebook.com/groups/{target}"
+        elif target.isdigit():
             base_url = f"https://www.facebook.com/profile.php?id={target}"
         else:
             base_url = f"https://www.facebook.com/{target}"
@@ -206,21 +222,45 @@ class FacebookPostScraper(BaseTool):
         def search_for_stories(data):
             stories = []
             if isinstance(data, dict):
-                typename = data.get("__typename")
+                typename = data.get("__typename", "")
+
+                # Profile/Page post nodes
                 if typename in ["Story", "FeedUnit"] or "comet_sections" in data:
                     if "id" in data or "comet_sections" in data:
                         stories.append(data)
+
+                # Group post nodes (GroupFeedUnit wraps the actual story)
+                if typename in ["GroupFeedUnit", "CometGroupDiscussionRootSuccessQuery"]:
+                    inner = data.get("story") or data.get("node")
+                    if inner:
+                        stories.append(inner)
+                    else:
+                        stories.append(data)
+
+                # Profile timeline feed edges
                 if "timeline_list_feed_units" in data:
                     units = data["timeline_list_feed_units"] or {}
                     for edge in units.get("edges", []):
                         node = edge.get("node")
                         if node:
                             stories.append(node)
+
+                # Group feed edges (two possible key names Facebook uses)
+                for group_feed_key in ["group_feed", "group_timeline_list_feed"]:
+                    if group_feed_key in data:
+                        feed = data[group_feed_key] or {}
+                        for edge in feed.get("edges", []):
+                            node = edge.get("node")
+                            if node:
+                                stories.append(node)
+
+                # Pinned post on profiles
                 if "profile_pinned_post" in data:
                     pinned = data["profile_pinned_post"] or {}
                     node = pinned.get("pinned_post_story")
                     if node:
                         stories.append(node)
+
                 for k, v in data.items():
                     stories.extend(search_for_stories(v))
             elif isinstance(data, list):
@@ -474,7 +514,17 @@ class FacebookPostScraper(BaseTool):
                 if "graphql" in response.url:
                     try:
                         text = response.text()
-                        if "timeline_list_feed_units" in text or "feedUnit" in text or "comet_sections" in text:
+                        # Profile/page feed keywords
+                        profile_keywords = [
+                            "timeline_list_feed_units", "feedUnit", "comet_sections"
+                        ]
+                        # Group feed keywords
+                        group_keywords = [
+                            "GroupFeedUnitEdge", "group_feed", "NodeGroupTimeline",
+                            "CometGroupDiscussionRootSuccessQuery", "group_timeline_list_feed"
+                        ]
+                        all_keywords = profile_keywords + group_keywords
+                        if any(k in text for k in all_keywords):
                             graphql_data.append(text)
                             packets_this_scroll += 1
                             console.print(f"[bold green]✓[/bold green] [cyan]Captured GraphQL packet ({len(text):,} bytes)[/cyan]")
