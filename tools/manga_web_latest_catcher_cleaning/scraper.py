@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import difflib
 import pandas as pd
 from rich.console import Console
 from rich.panel import Panel
@@ -16,6 +17,92 @@ except Exception:
 from core.base_tool import BaseTool
 
 console = Console()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_title(title: str) -> str:
+    """
+    Aggressively normalize a manga title for comparison:
+    - Lowercase
+    - Collapse repeated punctuation / dashes / spaces
+    - Strip leading/trailing noise characters
+    """
+    t = title.lower().strip()
+    # Replace typographic variants of dash/hyphen with a plain dash
+    t = re.sub(r'[\u2013\u2014\u2015\u2212\uff0d]', '-', t)
+    # Remove repeated dashes/spaces (e.g. "title - -" → "title -")
+    t = re.sub(r'[-\s]{2,}', ' ', t)
+    # Strip leading/trailing punctuation and spaces
+    t = t.strip(' -–—~.,;:!?')
+    # Collapse internal whitespace
+    t = re.sub(r'\s+', ' ', t)
+    return t
+
+
+def fuzzy_group(titles: list[str], threshold: float = 0.82) -> dict[str, str]:
+    """
+    Group similar titles using difflib.SequenceMatcher.
+    Returns a mapping {original_title -> canonical_title}.
+    The canonical title is the shortest normalized form in the group
+    (usually the cleanest, least-noisy version).
+
+    threshold: similarity ratio 0..1. Higher = stricter (fewer merges).
+               0.82 is a good default — catches "Title -" vs "Title" but
+               won't merge genuinely different manga.
+    """
+    # Build list of (normalized, original) pairs
+    pairs = [(normalize_title(t), t) for t in titles]
+
+    # Union-Find for grouping
+    parent = {t: t for t, _ in pairs}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            # Keep the lexicographically shorter normalized form as root
+            if len(ra) <= len(rb):
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+    norm_list = [n for n, _ in pairs]
+    for i in range(len(norm_list)):
+        for j in range(i + 1, len(norm_list)):
+            ratio = difflib.SequenceMatcher(
+                None, norm_list[i], norm_list[j], autojunk=False
+            ).ratio()
+            if ratio >= threshold:
+                union(norm_list[i], norm_list[j])
+
+    # Build original→canonical map using the original title of the root
+    # (pick the original title that maps to the shortest normalized root)
+    root_to_originals: dict[str, list[str]] = {}
+    for norm, orig in pairs:
+        root = find(norm)
+        root_to_originals.setdefault(root, []).append(orig)
+
+    mapping: dict[str, str] = {}
+    for root, originals in root_to_originals.items():
+        # Canonical = the original with the shortest normalized form
+        canonical = min(originals, key=lambda o: len(normalize_title(o)))
+        for orig in originals:
+            mapping[orig] = canonical
+
+    return mapping
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MangaWebLatestCatcherCleaning(BaseTool):
     @property
@@ -35,15 +122,22 @@ class MangaWebLatestCatcherCleaning(BaseTool):
         return "utility"
 
     def run(self, config: dict, cookies: dict) -> None:
-        console.print(Panel("[bold green]Manga Web Latest Catcher Cleaning[/bold green]\nExtract unique manga titles and their latest chapters from crawled data.", border_style="green"))
+        console.print(Panel(
+            "[bold green]Manga Web Latest Catcher Cleaning[/bold green]\n"
+            "Extract unique manga titles and their latest chapters from crawled data.\n"
+            "[dim]Uses fuzzy matching (difflib) to merge near-duplicate titles.[/dim]",
+            border_style="green"
+        ))
 
-        # Find CSV files in exports folder as suggestions
+        # ── File selection ────────────────────────────────────────────────────
         export_dir = config.get("settings", {}).get("default_export_dir", "exports")
         csv_files = []
         if os.path.exists(export_dir):
-            csv_files = [os.path.join(export_dir, f) for f in os.listdir(export_dir) if f.endswith(".csv")]
-        
-        # Sort files by modification time descending so the latest scraped file is listed first
+            csv_files = [
+                os.path.join(export_dir, f)
+                for f in os.listdir(export_dir)
+                if f.endswith(".csv")
+            ]
         csv_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
 
         choices = [os.path.basename(f) for f in csv_files]
@@ -59,130 +153,195 @@ class MangaWebLatestCatcherCleaning(BaseTool):
 
         if file_choice == "Input path manually..." or file_choice is None:
             input_file = questionary.text(
-                "Enter path to your scraped CSV file (e.g. exports/data_scraping_facebook.csv):",
+                "Enter path to your scraped CSV file:",
                 validate=lambda val: True if os.path.exists(val.strip()) else "File does not exist."
             ).ask()
             if not input_file:
                 return
             input_file = input_file.strip()
         else:
-            # Map choice back to full path
             idx = choices.index(file_choice)
             input_file = csv_files[idx]
 
-        # Suggest output files based on input filename
-        base, ext = os.path.splitext(input_file)
-        default_out_all = f"{base}_manga_clean.csv"
+        # ── Output paths ──────────────────────────────────────────────────────
+        base, _ = os.path.splitext(input_file)
+        default_out_all    = f"{base}_manga_clean.csv"
         default_out_latest = f"{base}_manga_latest_unique.csv"
 
-        out_all = questionary.text("Output file path for ALL cleaned manga records:", default=default_out_all).ask()
+        out_all = questionary.text(
+            "Output path for ALL cleaned records:", default=default_out_all
+        ).ask()
         if not out_all:
             return
         out_all = out_all.strip()
 
-        out_latest = questionary.text("Output file path for UNIQUE manga with LATEST chapter:", default=default_out_latest).ask()
+        out_latest = questionary.text(
+            "Output path for UNIQUE manga with LATEST chapter:", default=default_out_latest
+        ).ask()
         if not out_latest:
             return
         out_latest = out_latest.strip()
 
-        # Regular expressions
-        # Menangkap: "Title: X", "Title - X", "Title X", "TITLE: X", "Title ,: X", dll.
-        pattern_title = r"Title\s*[:,;~\-=\s]*\s*(.*?)(?=\n|$)"
-        # Mendukung chapter angka bulat maupun desimal (contoh: Chapter 6.1, Chapter 59.5, Chapter 88)
+        # ── Fuzzy threshold ───────────────────────────────────────────────────
+        threshold_str = questionary.text(
+            "Fuzzy similarity threshold for merging near-duplicate titles\n"
+            "  (0.0 = merge everything, 1.0 = exact match only, recommended: 0.82):",
+            default="0.82"
+        ).ask()
+        try:
+            fuzzy_threshold = float(threshold_str)
+            fuzzy_threshold = max(0.0, min(1.0, fuzzy_threshold))
+        except (ValueError, TypeError):
+            fuzzy_threshold = 0.82
+        console.print(f"[dim]Fuzzy threshold set to: {fuzzy_threshold}[/dim]")
+
+        # ── Regex patterns ────────────────────────────────────────────────────
+        pattern_title   = r"Title\s*[:,;~\-=\s]*\s*(.*?)(?=\n|$)"
         pattern_chapter = r"Chapter\s*[:,;~\-=\s]*\s*(\d+(?:\.\d+)?)"
 
         compiled_data = []
-
         console.print(f"[yellow]Reading {input_file} in chunks...[/yellow]")
-        
+
         try:
-            # Load data in chunks to save RAM
-            chunks = pd.read_csv(input_file, chunksize=100000)
-            
-            total_rows_processed = 0
-            extracted_count = 0
+            chunks = pd.read_csv(input_file, chunksize=100_000)
+            total_rows = 0
+            extracted  = 0
 
             for chunk in chunks:
-                total_rows_processed += len(chunk)
-                
-                # Check if 'Content' column exists
+                total_rows += len(chunk)
                 if 'Content' not in chunk.columns:
-                    console.print("[bold red]Error: CSV file must contain a 'Content' column.[/bold red]")
+                    console.print("[bold red]Error: CSV must contain a 'Content' column.[/bold red]")
                     return
-                
-                # Filter rows where Content contains 'Title' (case insensitive)
-                filtered_chunk = chunk[chunk['Content'].fillna('').str.contains(r'Title', case=False, regex=True)]
-                
-                for idx, row in filtered_chunk.iterrows():
+
+                filtered = chunk[
+                    chunk['Content'].fillna('').str.contains(r'Title', case=False, regex=True)
+                ]
+
+                for _, row in filtered.iterrows():
                     content = str(row['Content'])
-                    
-                    # Extract Title
-                    title_match = re.search(pattern_title, content, re.IGNORECASE)
-                    title = title_match.group(1).strip() if title_match else None
-                    
-                    # Extract Chapter
-                    chapter_match = re.search(pattern_chapter, content, re.IGNORECASE)
-                    chapter = chapter_match.group(1).strip() if chapter_match else None
-                    
-                    # Save if title is found
+                    title_m   = re.search(pattern_title,   content, re.IGNORECASE)
+                    chapter_m = re.search(pattern_chapter, content, re.IGNORECASE)
+                    title   = title_m.group(1).strip()   if title_m   else None
+                    chapter = chapter_m.group(1).strip() if chapter_m else None
+
                     if title:
-                        extracted_count += 1
+                        extracted += 1
                         compiled_data.append({
-                            'Post ID': row.get('Post ID', ''),
+                            'Post ID':   row.get('Post ID', ''),
                             'Timestamp': row.get('Timestamp', ''),
-                            'Title': title,
-                            'Chapter': chapter
+                            'Title':     title,
+                            'Chapter':   chapter,
                         })
 
+            console.print(
+                f"[green]Processed {total_rows:,} rows → "
+                f"extracted {extracted:,} manga records.[/green]"
+            )
+
             if not compiled_data:
-                console.print("[yellow]No manga title/chapter found in the content of the selected file.[/yellow]")
+                console.print("[yellow]No manga title/chapter found in the selected file.[/yellow]")
                 return
 
             df_clean = pd.DataFrame(compiled_data)
-            
-            # Export all cleaned records
+
+            # ── Save ALL cleaned records ──────────────────────────────────────
             df_clean.to_csv(out_all, index=False)
-            console.print(f"[green]✓ All cleaned data saved: [bold]{out_all}[/bold] ({len(df_clean)} rows)[/green]")
-
-            # Now, process unique manga with latest chapter
-            # We convert chapter to numeric to find the maximum/latest chapter.
-            df_clean['Chapter_Num'] = pd.to_numeric(df_clean['Chapter'], errors='coerce')
-            
-            # Handle Timestamp for sorting as a fallback
-            df_clean['Timestamp_DT'] = pd.to_datetime(df_clean['Timestamp'], errors='coerce')
-
-            # Create a normalized Title column for case-insensitive deduplication
-            df_clean['Title_Normalized'] = df_clean['Title'].str.strip().str.lower()
-
-            # Sort: Title_Normalized (alphabetical), Chapter_Num (descending, NaNs last), Timestamp_DT (descending)
-            df_clean = df_clean.sort_values(
-                by=['Title_Normalized', 'Chapter_Num', 'Timestamp_DT'], 
-                ascending=[True, False, False]
+            console.print(
+                f"[green]✓ All cleaned records saved: [bold]{out_all}[/bold] "
+                f"({len(df_clean):,} rows)[/green]"
             )
 
-            # Drop duplicates based on normalized title, keeping the first occurrence (highest chapter / latest timestamp)
-            df_latest = df_clean.drop_duplicates(subset=['Title_Normalized'], keep='first')
+            # ── Numeric chapter + timestamp for sorting ───────────────────────
+            df_clean['Chapter_Num']  = pd.to_numeric(df_clean['Chapter'], errors='coerce')
+            df_clean['Timestamp_DT'] = pd.to_datetime(df_clean['Timestamp'], errors='coerce')
 
-            # Remove temporary columns before saving
-            df_latest = df_latest.drop(columns=['Title_Normalized', 'Chapter_Num', 'Timestamp_DT'], errors='ignore')
+            # ── Pass 1: aggressive normalization dedup ────────────────────────
+            df_clean['Title_Norm'] = df_clean['Title'].apply(normalize_title)
 
-            # Export unique latest records
+            # Sort so highest chapter / latest timestamp wins
+            df_clean = df_clean.sort_values(
+                by=['Title_Norm', 'Chapter_Num', 'Timestamp_DT'],
+                ascending=[True, False, False],
+                na_position='last'
+            )
+            df_pass1 = df_clean.drop_duplicates(subset=['Title_Norm'], keep='first').copy()
+
+            before_fuzzy = len(df_pass1)
+            console.print(
+                f"[dim]After normalization dedup: {before_fuzzy:,} unique titles "
+                f"(was {len(df_clean):,})[/dim]"
+            )
+
+            # ── Pass 2: fuzzy matching dedup ──────────────────────────────────
+            console.print(
+                f"[yellow]Running fuzzy grouping on {before_fuzzy:,} titles "
+                f"(threshold={fuzzy_threshold})...[/yellow]"
+            )
+            unique_titles = df_pass1['Title'].tolist()
+            title_map = fuzzy_group(unique_titles, threshold=fuzzy_threshold)
+
+            # Apply mapping: replace title with canonical form
+            df_pass1['Title_Canonical'] = df_pass1['Title'].map(title_map)
+
+            # Among titles that map to the same canonical, keep highest chapter
+            df_pass1 = df_pass1.sort_values(
+                by=['Title_Canonical', 'Chapter_Num', 'Timestamp_DT'],
+                ascending=[True, False, False],
+                na_position='last'
+            )
+            df_latest = df_pass1.drop_duplicates(subset=['Title_Canonical'], keep='first').copy()
+
+            # Show merge report for any titles that were fuzzy-merged
+            merged_groups = {}
+            for orig, canon in title_map.items():
+                if orig != canon:
+                    merged_groups.setdefault(canon, []).append(orig)
+
+            if merged_groups:
+                console.print(f"\n[bold yellow]Fuzzy merge report — {len(merged_groups)} group(s) merged:[/bold yellow]")
+                for canon, dupes in merged_groups.items():
+                    console.print(f"  [green]✓ '{canon}'[/green] ← absorbed:")
+                    for d in dupes:
+                        console.print(f"      [dim]'{d}'[/dim]")
+            else:
+                console.print("[dim]No fuzzy merges occurred — all titles were already distinct.[/dim]")
+
+            after_fuzzy = len(df_latest)
+            console.print(
+                f"\n[green]Deduplication: {before_fuzzy:,} → {after_fuzzy:,} unique manga titles "
+                f"({before_fuzzy - after_fuzzy} merged)[/green]"
+            )
+
+            # Use the canonical title in the output
+            df_latest['Title'] = df_latest['Title_Canonical']
+
+            # Drop temp columns
+            drop_cols = ['Title_Norm', 'Title_Canonical', 'Chapter_Num', 'Timestamp_DT']
+            df_latest = df_latest.drop(columns=drop_cols, errors='ignore')
+
+            # ── Save unique latest ────────────────────────────────────────────
             df_latest.to_csv(out_latest, index=False)
-            console.print(f"[green]✓ Unique latest chapter data saved: [bold]{out_latest}[/bold] ({len(df_latest)} rows)[/green]")
+            console.print(
+                f"[green]✓ Unique latest chapter data saved: [bold]{out_latest}[/bold] "
+                f"({len(df_latest):,} rows)[/green]"
+            )
 
-            # Print a preview table of the unique latest chapters (top 10)
-            table = Table(title="Cleaned Manga Preview (Latest Chapter)", show_header=True, header_style="bold magenta")
-            table.add_column("Title", style="cyan", width=45)
+            # ── Preview table ─────────────────────────────────────────────────
+            table = Table(
+                title="Cleaned Manga Preview (Latest Chapter, Fuzzy-Deduped)",
+                show_header=True, header_style="bold magenta"
+            )
+            table.add_column("Title",          style="cyan",  width=45)
             table.add_column("Latest Chapter", justify="center", style="green", width=15)
-            table.add_column("Post ID", style="dim", width=15)
-            table.add_column("Timestamp", width=20)
+            table.add_column("Post ID",        style="dim",   width=15)
+            table.add_column("Timestamp",                     width=20)
 
-            for idx, row in df_latest.head(10).iterrows():
+            for _, row in df_latest.head(10).iterrows():
                 table.add_row(
                     str(row['Title']),
                     str(row['Chapter']) if pd.notna(row['Chapter']) else "N/A",
                     str(row['Post ID']),
-                    str(row['Timestamp'])
+                    str(row['Timestamp']),
                 )
             console.print(table)
 
@@ -191,3 +350,5 @@ class MangaWebLatestCatcherCleaning(BaseTool):
 
         except Exception as e:
             console.print(f"[bold red]An error occurred during cleaning: {e}[/bold red]")
+            import traceback
+            console.print(f"[dim]{traceback.format_exc()}[/dim]")
