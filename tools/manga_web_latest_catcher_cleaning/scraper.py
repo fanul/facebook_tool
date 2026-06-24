@@ -30,6 +30,10 @@ class MangaWebLatestCatcherCleaning(BaseTool):
     def description(self) -> str:
         return "Cleans and extracts unique manga titles with their latest chapter from scraped CSV files"
 
+    @property
+    def category(self) -> str:
+        return "utility"
+
     def run(self, config: dict, cookies: dict) -> None:
         console.print(Panel("[bold green]Manga Web Latest Catcher Cleaning[/bold green]\nExtract unique manga titles and their latest chapters from crawled data.", border_style="green"))
 

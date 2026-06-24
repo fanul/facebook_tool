@@ -19,6 +19,15 @@ class BaseTool(ABC):
         """Brief explanation of what the tool does"""
         pass
 
+    @property
+    def category(self) -> str:
+        """
+        Category of the tool. Controls which menu section it appears in.
+        - 'scraper'  : appears under 'Run Scraping Tool' (default)
+        - 'utility'  : appears under 'Additional Tools / Utilities'
+        """
+        return "scraper"
+
     @abstractmethod
     def run(self, config: dict, cookies: dict) -> None:
         """Run the tool's main functionality"""

@@ -208,53 +208,59 @@ def main():
     config = load_config()
     show_banner()
     
-    # Load dynamic tools/plugins
-    tools_list = load_tools()
-    
+    # Load dynamic tools/plugins and split by category
+    all_tools = load_tools()
+    scraper_tools  = [t for t in all_tools if t.category == "scraper"]
+    utility_tools  = [t for t in all_tools if t.category == "utility"]
+
+    def run_tool_menu(tools_subset: list, menu_title: str):
+        """Show a submenu for a specific list of tools and run the chosen one."""
+        tool_choices = [f"{t.name} - {t.description}" for t in tools_subset]
+        tool_choices.append("← Back to main menu")
+
+        tool_choice = questionary.select(menu_title, choices=tool_choices).ask()
+
+        if tool_choice and tool_choice != "← Back to main menu":
+            selected_name = tool_choice.split(" - ")[0]
+            tool_to_run = next((t for t in tools_subset if t.name == selected_name), None)
+            if tool_to_run:
+                try:
+                    tool_to_run.run(config, config.get("active_cookies", {}))
+                except Exception as e:
+                    console.print(f"[bold red]An unexpected error occurred: {e}[/bold red]")
+                questionary.text("\nPress Enter to return to main menu...").ask()
+
     while True:
-        # Build menu choices
+        # Build main menu choices dynamically
         choices = []
-        if tools_list:
-            choices.append("Run Scraping Tool")
+        if scraper_tools:
+            choices.append("🔍 Run Scraping Tool")
+        if utility_tools:
+            choices.append("🛠  Additional Tools / Utilities")
         choices.extend([
-            "Manage Authentication (Facebook Cookies)",
-            "Edit Settings",
-            "Exit"
+            "🔑 Manage Authentication (Facebook Cookies)",
+            "⚙  Edit Settings",
+            "🚪 Exit"
         ])
-        
+
         choice = questionary.select(
             "Select an option from the main menu:",
             choices=choices
         ).ask()
-        
-        if choice == "Run Scraping Tool":
-            tool_choices = [f"{t.name} - {t.description}" for t in tools_list]
-            tool_choices.append("Back to main menu")
-            
-            tool_choice = questionary.select(
-                "Select a scraper tool to run:",
-                choices=tool_choices
-            ).ask()
-            
-            if tool_choice != "Back to main menu":
-                selected_name = tool_choice.split(" - ")[0]
-                tool_to_run = next((t for t in tools_list if t.name == selected_name), None)
-                
-                if tool_to_run:
-                    try:
-                        tool_to_run.run(config, config.get("active_cookies", {}))
-                    except Exception as e:
-                        console.print(f"[bold red]An unexpected error occurred while running the tool: {e}[/bold red]")
-                    
-                    questionary.text("\nPress Enter to return to main menu...").ask()
-                    
-        elif choice == "Manage Authentication (Facebook Cookies)":
+
+        if choice == "🔍 Run Scraping Tool":
+            run_tool_menu(scraper_tools, "Select a scraper tool to run:")
+
+        elif choice == "🛠  Additional Tools / Utilities":
+            run_tool_menu(utility_tools, "Select a utility tool to run:")
+
+        elif choice == "🔑 Manage Authentication (Facebook Cookies)":
             manage_auth(config)
-            
-        elif choice == "Edit Settings":
+
+        elif choice == "⚙  Edit Settings":
             manage_settings(config)
-            
-        elif choice == "Exit" or choice is None:
+
+        elif choice == "🚪 Exit" or choice is None:
             console.print("[bold blue]Thank you for using Modular Scraper Suite. Goodbye![/bold blue]")
             break
 
